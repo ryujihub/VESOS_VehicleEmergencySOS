@@ -4,12 +4,12 @@ import { getAuth } from "firebase/auth";
 
 // TODO: Replace this with your actual Firebase Project config from the Firebase Console
 const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "your-project-id.firebaseapp.com",
+  apiKey: "AIzaSyBgYfiI6lHHUmcL1ceF_8R52cV_Ul_bLT4",
+  authDomain: "ayudaauto-4010e.firebaseapp.com",
   projectId: "ayudaauto-4010e",
-  storageBucket: "your-project-id.firebasestorage.app",
-  messagingSenderId: "1234567890",
-  appId: "1:1234567890:web:abcdef123456"
+  storageBucket: "ayudaauto-4010e.firebasestorage.app",
+  messagingSenderId: "90995546965",
+  appId: "1:90995546965:web:639b332d8bf9834035eddc"
 };
 
 // Initialize Firebase
