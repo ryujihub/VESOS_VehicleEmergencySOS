@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { ActivityIndicator, View, StyleSheet } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
-import { createStackNavigator } from '@react-navigation/stack';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc } from 'firebase/firestore';
@@ -11,7 +11,7 @@ import LoginScreen from './src/screens/LoginScreen';
 import CustomerDashboard from './src/screens/CustomerDashboard';
 import MechanicDashboard from './src/screens/MechanicDashboard';
 
-const Stack = createStackNavigator();
+const Stack = createNativeStackNavigator();
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -19,12 +19,10 @@ export default function App() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Listen for Authentication State from Firebase
     const unsubscribe = onAuthStateChanged(auth, async (authenticatedUser) => {
       if (authenticatedUser) {
         setUser(authenticatedUser);
         try {
-          // Check role (CUSTOMER vs MECHANIC)
           const userDoc = await getDoc(doc(db, 'users', authenticatedUser.uid));
           if (userDoc.exists()) {
             setRole(userDoc.data().role);
