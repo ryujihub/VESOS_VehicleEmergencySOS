@@ -7,18 +7,20 @@ import { useFonts, SpaceGrotesk_500Medium, SpaceGrotesk_600SemiBold, SpaceGrotes
 import { Inter_400Regular, Inter_500Medium, Inter_600SemiBold } from '@expo-google-fonts/inter';
 import { theme } from './src/theme/theme';
 import { onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc } from 'firebase/firestore';
+import { doc, onSnapshot } from 'firebase/firestore';
 import { auth, db } from './firebaseConfig';
 
 import LoginScreen from './src/screens/LoginScreen';
 import CustomerDashboard from './src/screens/CustomerDashboard';
 import MechanicDashboard from './src/screens/MechanicDashboard';
+import RegistrationScreen from './src/screens/RegistrationScreen';
 
 const Stack = createNativeStackNavigator();
 
 export default function App() {
   const [user, setUser] = useState(null);
   const [role, setRole] = useState(null);
+  const [isSetupComplete, setIsSetupComplete] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const [fontsLoaded] = useFonts({
@@ -30,24 +32,29 @@ export default function App() {
   });
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (authenticatedUser) => {
+    let unsubUser = () => {};
+    const unsubAuth = onAuthStateChanged(auth, (authenticatedUser) => {
+      unsubUser(); // clean up previous listener
       if (authenticatedUser) {
         setUser(authenticatedUser);
-        try {
-          const userDoc = await getDoc(doc(db, 'users', authenticatedUser.uid));
-          if (userDoc.exists()) {
-            setRole(userDoc.data().role);
+        unsubUser = onSnapshot(doc(db, 'users', authenticatedUser.uid), (snap) => {
+          if (snap.exists()) {
+            setRole(snap.data().role);
+            setIsSetupComplete(!!snap.data().isSetupComplete);
           }
-        } catch (e) {
-          console.error("Error fetching user data:", e);
-        }
+          setLoading(false);
+        }, (e) => {
+          console.error('User doc error:', e);
+          setLoading(false);
+        });
       } else {
         setUser(null);
         setRole(null);
+        setIsSetupComplete(false);
+        setLoading(false);
       }
-      setLoading(false);
     });
-    return unsubscribe;
+    return () => { unsubAuth(); unsubUser(); };
   }, []);
 
   if (loading || !fontsLoaded) {
@@ -75,6 +82,10 @@ export default function App() {
         <Stack.Navigator>
           {!user ? (
             <Stack.Screen name="Login" component={LoginScreen} options={{ headerShown: false }} />
+          ) : !isSetupComplete ? (
+            <Stack.Screen name="Registration" options={{ headerShown: false }}>
+              {() => <RegistrationScreen role={role} />}
+            </Stack.Screen>
           ) : role === 'CUSTOMER' ? (
             <Stack.Screen name="CustomerDashboard" component={CustomerDashboard} options={{ title: 'Customer SOS' }} />
           ) : role === 'MECHANIC' ? (

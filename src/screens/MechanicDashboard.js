@@ -2,14 +2,27 @@ import React, { useState, useEffect } from 'react';
 import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Image } from 'react-native';
 import { MapPin, Siren, Car as CarIcon, CheckCircle2, Navigation, PhoneCall } from 'lucide-react-native';
 import { theme, fonts } from '../theme/theme';
-import { collection, onSnapshot, query, where, doc, updateDoc } from 'firebase/firestore';
+import { collection, onSnapshot, query, where, doc, updateDoc, getDoc } from 'firebase/firestore';
 import { auth, db } from '../../firebaseConfig';
 
 export default function MechanicDashboard() {
   const [online, setOnline] = useState(true);
-  const [request, setRequest] = useState(null); // null | "incoming" | "accepted"
-  const [jobStatus, setJobStatus] = useState("accepted"); // "accepted" | "enroute" | "arrived" | "done"
+  const [request, setRequest] = useState(null);
+  const [jobStatus, setJobStatus] = useState("accepted");
   const [requestData, setRequestData] = useState(null);
+  const [mechanicName, setMechanicName] = useState('Mechanic');
+  const [shopName, setShopName] = useState('Your Shop');
+
+  useEffect(() => {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
+    getDoc(doc(db, 'users', uid)).then((snap) => {
+      if (snap.exists()) {
+        setMechanicName(snap.data().name || 'Mechanic');
+        setShopName(snap.data().shopName || 'Your Shop');
+      }
+    });
+  }, []);
 
   useEffect(() => {
     let unsub = () => {};
@@ -81,8 +94,8 @@ export default function MechanicDashboard() {
     <View style={styles.container}>
       <View style={styles.header}>
         <View>
-          <Text style={styles.shopName}>Kuya Mando's Auto Repair</Text>
-          <Text style={styles.shopLocation}>Rodriguez, Rizal</Text>
+          <Text style={styles.shopName}>{shopName}</Text>
+          <Text style={styles.shopLocation}>{mechanicName}</Text>
         </View>
         <TouchableOpacity
           onPress={() => setOnline(!online)}

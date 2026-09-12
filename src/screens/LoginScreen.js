@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ActivityIndicator } from 'react-native';
-import { signInAnonymously } from 'firebase/auth';
+import { signInAnonymously, signInWithPhoneNumber } from 'firebase/auth';
 import { doc, setDoc } from 'firebase/firestore';
-import { auth, db } from '../../firebaseConfig'; 
+import { FirebaseRecaptchaVerifierModal } from 'expo-firebase-recaptcha';
+import { auth, db, app, firebaseConfig } from '../../firebaseConfig';
 import { theme, fonts } from '../theme/theme';
 import { Siren } from 'lucide-react-native';
 
@@ -10,43 +11,61 @@ export default function LoginScreen() {
     const [role, setRole] = useState('CUSTOMER');
     const [phone, setPhone] = useState('');
     const [otp, setOtp] = useState('');
-    const [otpSent, setOtpSent] = useState(false);
+    const [confirmation, setConfirmation] = useState(null);
     const [loading, setLoading] = useState(false);
+    const recaptchaVerifier = useRef(null);
 
-    const handleAuth = async () => {
+    const handleSendOtp = async () => {
+        const formatted = phone.startsWith('0')
+            ? `+63${phone.slice(1)}`
+            : phone.startsWith('+') ? phone : `+63${phone}`;
+
+        if (formatted.length < 12) {
+            Alert.alert('Error', 'Please enter a valid Philippine mobile number.');
+            return;
+        }
         setLoading(true);
         try {
-            if (role === 'CUSTOMER') {
-                const userCred = await signInAnonymously(auth);
-                await setDoc(doc(db, 'users', userCred.user.uid), {
-                    role: 'CUSTOMER',
-                    createdAt: new Date()
-                }, { merge: true });
-            } else {
-                if (!otpSent) {
-                    if (phone.length < 10) {
-                        Alert.alert("Error", "Please enter a valid phone number.");
-                        setLoading(false);
-                        return;
-                    }
-                    setOtpSent(true);
-                } else {
-                    if (otp !== '123456') {
-                        Alert.alert("Error", "Invalid OTP. Use demo code: 123456");
-                        setLoading(false);
-                        return;
-                    }
-                    const userCred = await signInAnonymously(auth);
-                    await setDoc(doc(db, 'users', userCred.user.uid), {
-                        role: 'MECHANIC',
-                        phone: phone,
-                        isVerified: true,
-                        createdAt: new Date()
-                    }, { merge: true });
-                }
-            }
-        } catch (error) {
-            Alert.alert("Authentication Error", error.message);
+            const result = await signInWithPhoneNumber(auth, formatted, recaptchaVerifier.current);
+            setConfirmation(result);
+        } catch (e) {
+            Alert.alert('Error sending OTP', e.message);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleVerifyOtp = async () => {
+        if (!otp || otp.length < 6) {
+            Alert.alert('Error', 'Please enter the 6-digit code sent to your phone.');
+            return;
+        }
+        setLoading(true);
+        try {
+            const userCred = await confirmation.confirm(otp);
+            await setDoc(doc(db, 'users', userCred.user.uid), {
+                role: 'MECHANIC',
+                phone: userCred.user.phoneNumber,
+                isVerified: true,
+                createdAt: new Date(),
+            }, { merge: true });
+        } catch (e) {
+            Alert.alert('Invalid OTP', 'The code you entered is incorrect. Please try again.');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleCustomerLogin = async () => {
+        setLoading(true);
+        try {
+            const userCred = await signInAnonymously(auth);
+            await setDoc(doc(db, 'users', userCred.user.uid), {
+                role: 'CUSTOMER',
+                createdAt: new Date(),
+            }, { merge: true });
+        } catch (e) {
+            Alert.alert('Error', e.message);
         } finally {
             setLoading(false);
         }
@@ -54,6 +73,12 @@ export default function LoginScreen() {
 
     return (
         <View style={styles.container}>
+            <FirebaseRecaptchaVerifierModal
+                ref={recaptchaVerifier}
+                firebaseConfig={firebaseConfig}
+                attemptInvisibleVerification={true}
+            />
+
             <View style={styles.logoContainer}>
                 <View style={styles.row}>
                     <Siren size={28} color={theme.amber} />
@@ -66,14 +91,14 @@ export default function LoginScreen() {
                 <View style={[styles.roleContainer, { marginTop: 0 }]}>
                     <Text style={styles.roleLabel}>I AM A:</Text>
                     <View style={styles.roleTabs}>
-                        <TouchableOpacity 
-                            onPress={() => { setRole('CUSTOMER'); setOtpSent(false); }} 
+                        <TouchableOpacity
+                            onPress={() => { setRole('CUSTOMER'); setConfirmation(null); }}
                             style={[styles.roleTab, role === 'CUSTOMER' && styles.roleTabActive]}
                         >
                             <Text style={[styles.roleTabText, role === 'CUSTOMER' && styles.roleTabTextActive]}>Driver</Text>
                         </TouchableOpacity>
-                        <TouchableOpacity 
-                            onPress={() => { setRole('MECHANIC'); setOtpSent(false); }} 
+                        <TouchableOpacity
+                            onPress={() => { setRole('MECHANIC'); setConfirmation(null); }}
                             style={[styles.roleTab, role === 'MECHANIC' && styles.roleTabActive]}
                         >
                             <Text style={[styles.roleTabText, role === 'MECHANIC' && styles.roleTabTextActive]}>Mechanic</Text>
@@ -83,7 +108,7 @@ export default function LoginScreen() {
 
                 {role === 'CUSTOMER' ? (
                     <View style={{ marginTop: 12 }}>
-                        <TouchableOpacity onPress={handleAuth} style={styles.primaryBtn} disabled={loading}>
+                        <TouchableOpacity onPress={handleCustomerLogin} style={styles.primaryBtn} disabled={loading}>
                             {loading ? <ActivityIndicator color={theme.bg} /> : <Text style={styles.primaryBtnText}>Continue as Guest Driver</Text>}
                         </TouchableOpacity>
                         <Text style={[styles.subtitle, { textAlign: 'center', marginTop: 16 }]}>
@@ -92,7 +117,7 @@ export default function LoginScreen() {
                     </View>
                 ) : (
                     <View style={{ marginTop: 12 }}>
-                        {!otpSent ? (
+                        {!confirmation ? (
                             <>
                                 <Text style={[styles.roleLabel, { textAlign: 'left' }]}>MOBILE NUMBER</Text>
                                 <TextInput
@@ -103,8 +128,8 @@ export default function LoginScreen() {
                                     value={phone}
                                     onChangeText={setPhone}
                                 />
-                                <TouchableOpacity style={styles.primaryBtn} onPress={handleAuth} disabled={loading || !phone}>
-                                    {loading ? <ActivityIndicator color={theme.bg} /> : <Text style={styles.primaryBtnText}>Send OTP Code</Text>}
+                                <TouchableOpacity style={styles.primaryBtn} onPress={handleSendOtp} disabled={loading || !phone}>
+                                    {loading ? <ActivityIndicator color={theme.bg} /> : <Text style={styles.primaryBtnText}>Send Verification Code</Text>}
                                 </TouchableOpacity>
                             </>
                         ) : (
@@ -112,19 +137,21 @@ export default function LoginScreen() {
                                 <Text style={[styles.roleLabel, { textAlign: 'left' }]}>ENTER 6-DIGIT OTP</Text>
                                 <TextInput
                                     style={styles.input}
-                                    placeholder="123456"
+                                    placeholder="_ _ _ _ _ _"
                                     placeholderTextColor={theme.textFaint}
                                     keyboardType="number-pad"
                                     value={otp}
                                     onChangeText={setOtp}
                                     maxLength={6}
                                 />
-                                <Text style={[styles.subtitle, { marginTop: 4, marginBottom: 16 }]}>Demo OTP System Active</Text>
-                                <TouchableOpacity style={styles.primaryBtn} onPress={handleAuth} disabled={loading || otp.length < 6}>
+                                <Text style={[styles.subtitle, { marginTop: 4, marginBottom: 16 }]}>
+                                    Code sent to {phone}
+                                </Text>
+                                <TouchableOpacity style={styles.primaryBtn} onPress={handleVerifyOtp} disabled={loading || otp.length < 6}>
                                     {loading ? <ActivityIndicator color={theme.bg} /> : <Text style={styles.primaryBtnText}>Verify & Login</Text>}
                                 </TouchableOpacity>
-                                <TouchableOpacity style={styles.switchBtn} onPress={() => setOtpSent(false)}>
-                                    <Text style={styles.switchBtnText}>Back to Phone Number</Text>
+                                <TouchableOpacity style={styles.switchBtn} onPress={() => setConfirmation(null)}>
+                                    <Text style={styles.switchBtnText}>← Different number</Text>
                                 </TouchableOpacity>
                             </>
                         )}
@@ -152,7 +179,8 @@ const styles = StyleSheet.create({
         color: theme.text,
         fontFamily: fonts.body,
         fontSize: 15,
-        marginBottom: 16
+        marginBottom: 16,
+        letterSpacing: 4,
     },
     roleContainer: { marginBottom: 24, marginTop: 8 },
     roleLabel: { fontFamily: fonts.bodySemibold, fontSize: 12, color: theme.textMuted, marginBottom: 8, textAlign: 'center' },
@@ -166,9 +194,9 @@ const styles = StyleSheet.create({
         borderRadius: 8,
         paddingVertical: 16,
         alignItems: 'center',
-        marginTop: 10
+        marginTop: 10,
     },
     primaryBtnText: { fontFamily: fonts.displayBold, fontSize: 16, color: theme.bg },
-    switchBtn: { marginTop: 24, alignItems: 'center' },
-    switchBtnText: { fontFamily: fonts.body, fontSize: 13, color: theme.textMuted }
+    switchBtn: { marginTop: 20, alignItems: 'center' },
+    switchBtnText: { fontFamily: fonts.body, fontSize: 13, color: theme.textMuted },
 });
