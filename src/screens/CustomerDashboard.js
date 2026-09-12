@@ -4,7 +4,7 @@ import { Siren, PhoneCall, MessageSquareWarning, MapPin, Car as CarIcon, CheckCi
 import * as Location from 'expo-location';
 import * as SMS from 'expo-sms';
 import * as ImagePicker from 'expo-image-picker';
-import MapView, { Marker } from 'react-native-maps';
+import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps';
 import { auth, db, storage } from '../../firebaseConfig';
 import { collection, addDoc, serverTimestamp, doc, onSnapshot } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
@@ -322,6 +322,7 @@ export default function CustomerDashboard() {
             {Platform.OS !== 'web' && initialLocation && (
               <View style={{ marginTop: 12, height: 120, borderRadius: 8, overflow: 'hidden' }}>
                 <MapView 
+                  provider={PROVIDER_GOOGLE}
                   style={{ flex: 1 }} 
                   initialRegion={{
                     latitude: initialLocation.latitude,

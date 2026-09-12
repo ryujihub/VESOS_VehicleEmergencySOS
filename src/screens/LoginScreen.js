@@ -1,9 +1,8 @@
 import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ActivityIndicator } from 'react-native';
-import { signInAnonymously, signInWithPhoneNumber } from 'firebase/auth';
+import { signInAnonymously } from 'firebase/auth';
 import { doc, setDoc } from 'firebase/firestore';
-import { FirebaseRecaptchaVerifierModal } from 'expo-firebase-recaptcha';
-import { auth, db, app, firebaseConfig } from '../../firebaseConfig'; 
+import { auth, db } from '../../firebaseConfig'; 
 import { theme, fonts } from '../theme/theme';
 import { Siren } from 'lucide-react-native';
 
@@ -11,8 +10,7 @@ export default function LoginScreen() {
     const [role, setRole] = useState('CUSTOMER');
     const [phone, setPhone] = useState('');
     const [otp, setOtp] = useState('');
-    const [verificationId, setVerificationId] = useState(null);
-    const recaptchaVerifier = React.useRef(null);
+    const [otpSent, setOtpSent] = useState(false);
     const [loading, setLoading] = useState(false);
 
     const handleAuth = async () => {
@@ -25,25 +23,23 @@ export default function LoginScreen() {
                     createdAt: new Date()
                 }, { merge: true });
             } else {
-                if (!verificationId) {
+                if (!otpSent) {
                     if (phone.length < 10) {
                         Alert.alert("Error", "Please enter a valid phone number.");
                         setLoading(false);
                         return;
                     }
-                    const formatPhone = phone.startsWith('0') ? `+63${phone.slice(1)}` : (phone.startsWith('+') ? phone : `+63${phone}`);
-                    const confirmationResult = await signInWithPhoneNumber(auth, formatPhone, recaptchaVerifier.current);
-                    setVerificationId(confirmationResult);
+                    setOtpSent(true);
                 } else {
-                    if (otp.length < 6) {
-                        Alert.alert("Error", "Invalid OTP.");
+                    if (otp !== '123456') {
+                        Alert.alert("Error", "Invalid OTP. Use demo code: 123456");
                         setLoading(false);
                         return;
                     }
-                    const userCred = await verificationId.confirm(otp);
+                    const userCred = await signInAnonymously(auth);
                     await setDoc(doc(db, 'users', userCred.user.uid), {
                         role: 'MECHANIC',
-                        phone: userCred.user.phoneNumber,
+                        phone: phone,
                         isVerified: true,
                         createdAt: new Date()
                     }, { merge: true });
@@ -67,24 +63,17 @@ export default function LoginScreen() {
             </View>
 
             <View style={styles.formContainer}>
-                
-                <FirebaseRecaptchaVerifierModal
-                    ref={recaptchaVerifier}
-                    firebaseConfig={firebaseConfig}
-                    attemptInvisibleVerification={false}
-                />
-
                 <View style={[styles.roleContainer, { marginTop: 0 }]}>
                     <Text style={styles.roleLabel}>I AM A:</Text>
                     <View style={styles.roleTabs}>
                         <TouchableOpacity 
-                            onPress={() => { setRole('CUSTOMER'); setVerificationId(null); }} 
+                            onPress={() => { setRole('CUSTOMER'); setOtpSent(false); }} 
                             style={[styles.roleTab, role === 'CUSTOMER' && styles.roleTabActive]}
                         >
                             <Text style={[styles.roleTabText, role === 'CUSTOMER' && styles.roleTabTextActive]}>Driver</Text>
                         </TouchableOpacity>
                         <TouchableOpacity 
-                            onPress={() => { setRole('MECHANIC'); setVerificationId(null); }} 
+                            onPress={() => { setRole('MECHANIC'); setOtpSent(false); }} 
                             style={[styles.roleTab, role === 'MECHANIC' && styles.roleTabActive]}
                         >
                             <Text style={[styles.roleTabText, role === 'MECHANIC' && styles.roleTabTextActive]}>Mechanic</Text>
@@ -103,7 +92,7 @@ export default function LoginScreen() {
                     </View>
                 ) : (
                     <View style={{ marginTop: 12 }}>
-                        {!verificationId ? (
+                        {!otpSent ? (
                             <>
                                 <Text style={[styles.roleLabel, { textAlign: 'left' }]}>MOBILE NUMBER</Text>
                                 <TextInput
@@ -130,18 +119,17 @@ export default function LoginScreen() {
                                     onChangeText={setOtp}
                                     maxLength={6}
                                 />
-                                <Text style={[styles.subtitle, { marginTop: 4, marginBottom: 16 }]}>Code sent via SMS</Text>
+                                <Text style={[styles.subtitle, { marginTop: 4, marginBottom: 16 }]}>Demo OTP System Active</Text>
                                 <TouchableOpacity style={styles.primaryBtn} onPress={handleAuth} disabled={loading || otp.length < 6}>
                                     {loading ? <ActivityIndicator color={theme.bg} /> : <Text style={styles.primaryBtnText}>Verify & Login</Text>}
                                 </TouchableOpacity>
-                                <TouchableOpacity style={styles.switchBtn} onPress={() => setVerificationId(null)}>
+                                <TouchableOpacity style={styles.switchBtn} onPress={() => setOtpSent(false)}>
                                     <Text style={styles.switchBtnText}>Back to Phone Number</Text>
                                 </TouchableOpacity>
                             </>
                         )}
                     </View>
                 )}
-
             </View>
         </View>
     );

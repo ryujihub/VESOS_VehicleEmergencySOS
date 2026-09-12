@@ -1,3 +1,4 @@
+import React, { useState, useEffect } from 'react';
 import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Image } from 'react-native';
 import { MapPin, Siren, Car as CarIcon, CheckCircle2, Navigation, PhoneCall } from 'lucide-react-native';
 import { theme, fonts } from '../theme/theme';
