@@ -1,21 +1,41 @@
 {
   "expo": {
-    "name": "mobile",
-    "slug": "mobile",
+    "name": "AyudaAuto",
+    "slug": "ayudaauto",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0D0E10"
+    },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.ayudaauto.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "AyudaAuto needs your location to find nearby mechanics.",
+        "NSCameraUsageDescription": "AyudaAuto needs camera access to take photos of your vehicle situation.",
+        "NSPhotoLibraryUsageDescription": "AyudaAuto needs photo library access."
+      }
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#0D0E10",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
+      "package": "com.ayudaauto.app",
+      "versionCode": 1,
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE",
+        "SEND_SMS"
+      ],
       "config": {
         "googleMaps": {
           "apiKey": "AIzaSyA54Km_eCgDiQbJLqhirvBGZwaQE1NhhnI"
@@ -26,7 +46,23 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "expo-font"
+      "expo-font",
+      "expo-location",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "AyudaAuto needs photo library access to attach vehicle photos.",
+          "cameraPermission": "AyudaAuto needs camera access to photograph your vehicle situation."
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
     ]
   }
 }
