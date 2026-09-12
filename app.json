@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "AyudaAuto",
-    "slug": "ayudaauto",
+    "name": "VESOS",
+    "slug": "VESOS",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -13,11 +13,11 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.ayudaauto.app",
+      "bundleIdentifier": "com.vesos.app",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "AyudaAuto needs your location to find nearby mechanics.",
-        "NSCameraUsageDescription": "AyudaAuto needs camera access to take photos of your vehicle situation.",
-        "NSPhotoLibraryUsageDescription": "AyudaAuto needs photo library access."
+        "NSLocationWhenInUseUsageDescription": "VESOS needs your location to find nearby mechanics.",
+        "NSCameraUsageDescription": "VESOS needs camera access to take photos of your vehicle situation.",
+        "NSPhotoLibraryUsageDescription": "VESOS needs photo library access."
       }
     },
     "android": {
@@ -27,7 +27,7 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "package": "com.ayudaauto.app",
+      "package": "com.vesos.app",
       "versionCode": 1,
       "permissions": [
         "ACCESS_FINE_LOCATION",
@@ -51,8 +51,8 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "AyudaAuto needs photo library access to attach vehicle photos.",
-          "cameraPermission": "AyudaAuto needs camera access to photograph your vehicle situation."
+          "photosPermission": "VESOS needs photo library access to attach vehicle photos.",
+          "cameraPermission": "VESOS needs camera access to photograph your vehicle situation."
         }
       ],
       [
