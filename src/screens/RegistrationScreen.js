@@ -5,17 +5,18 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import * as ImagePicker from 'expo-image-picker';
 import { auth, db, storage } from '../../firebaseConfig';
 import { theme, fonts } from '../theme/theme';
-import { Siren, Camera, User, Wrench } from 'lucide-react-native';
+import { Siren, Camera, User, Wrench, Phone } from 'lucide-react-native';
 
 export default function RegistrationScreen({ role }) {
   const [fullName, setFullName] = useState('');
   const [shopName, setShopName] = useState('');
+  const [contactNumber, setContactNumber] = useState('');
   const [idPhoto, setIdPhoto] = useState(null);
   const [loading, setLoading] = useState(false);
 
   const pickId = async () => {
     let result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ImagePicker.MediaType.Images,
+      mediaTypes: ['images'],
       allowsEditing: true,
       quality: 0.7,
     });
@@ -29,6 +30,10 @@ export default function RegistrationScreen({ role }) {
     }
     if (role === 'MECHANIC' && !shopName.trim()) {
       Alert.alert('Required', 'Please enter your shop or business name.');
+      return;
+    }
+    if (role === 'MECHANIC' && contactNumber.replace(/[^0-9]/g, '').length < 7) {
+      Alert.alert('Required', 'Please enter a valid contact number so customers can reach you.');
       return;
     }
 
@@ -51,7 +56,7 @@ export default function RegistrationScreen({ role }) {
 
       await updateDoc(doc(db, 'users', uid), {
         name: fullName.trim(),
-        ...(role === 'MECHANIC' && { shopName: shopName.trim() }),
+        ...(role === 'MECHANIC' && { shopName: shopName.trim(), contactNumber: contactNumber.trim() }),
         ...(idUrl && { idUrl }),
         isSetupComplete: true,
       });
@@ -103,6 +108,19 @@ export default function RegistrationScreen({ role }) {
                 placeholderTextColor={theme.textFaint}
                 value={shopName}
                 onChangeText={setShopName}
+              />
+            </View>
+
+            <Text style={[styles.label, { marginTop: 20 }]}>CONTACT NUMBER</Text>
+            <View style={styles.inputRow}>
+              <Phone size={16} color={theme.textFaint} />
+              <TextInput
+                style={styles.input}
+                placeholder="0917 123 4567"
+                placeholderTextColor={theme.textFaint}
+                value={contactNumber}
+                onChangeText={(text) => setContactNumber(text.replace(/[^0-9+ ]/g, ''))}
+                keyboardType="phone-pad"
               />
             </View>
 

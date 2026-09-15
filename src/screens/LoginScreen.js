@@ -1,56 +1,49 @@
-import React, { useState, useRef } from 'react';
+import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ActivityIndicator } from 'react-native';
-import { signInAnonymously, signInWithPhoneNumber } from 'firebase/auth';
+import { signInAnonymously, signInWithEmailAndPassword, createUserWithEmailAndPassword, sendEmailVerification } from 'firebase/auth';
 import { doc, setDoc } from 'firebase/firestore';
-import { FirebaseRecaptchaVerifierModal } from 'expo-firebase-recaptcha';
-import { auth, db, app, firebaseConfig } from '../../firebaseConfig';
+import { auth, db } from '../../firebaseConfig';
 import { theme, fonts } from '../theme/theme';
 import { Siren } from 'lucide-react-native';
 
 export default function LoginScreen() {
     const [role, setRole] = useState('CUSTOMER');
-    const [phone, setPhone] = useState('');
-    const [otp, setOtp] = useState('');
-    const [confirmation, setConfirmation] = useState(null);
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+    const [isRegistering, setIsRegistering] = useState(false);
     const [loading, setLoading] = useState(false);
-    const recaptchaVerifier = useRef(null);
 
-    const handleSendOtp = async () => {
-        const formatted = phone.startsWith('0')
-            ? `+63${phone.slice(1)}`
-            : phone.startsWith('+') ? phone : `+63${phone}`;
-
-        if (formatted.length < 12) {
-            Alert.alert('Error', 'Please enter a valid Philippine mobile number.');
+    const handleEmailAuth = async () => {
+        if (!email.trim() || !password.trim()) {
+            Alert.alert('Required', 'Please enter your email and password.');
             return;
         }
         setLoading(true);
         try {
-            const result = await signInWithPhoneNumber(auth, formatted, recaptchaVerifier.current);
-            setConfirmation(result);
+            if (isRegistering) {
+                const userCred = await createUserWithEmailAndPassword(auth, email.trim(), password);
+                // Ask Firebase to send the verification link. If this fails we still
+                // create the account — the VerifyEmail screen has a resend button.
+                try {
+                    await sendEmailVerification(userCred.user);
+                } catch (emailErr) {
+                    console.warn('Verification email failed to send:', emailErr);
+                }
+                await setDoc(doc(db, 'users', userCred.user.uid), {
+                    role: 'MECHANIC',
+                    email: userCred.user.email,
+                    isVerified: false,
+                    createdAt: new Date(),
+                }, { merge: true });
+                Alert.alert(
+                    'Verify your email',
+                    `We sent a verification link to ${userCred.user.email}. Tap it, then come back to finish setting up your shop profile.`
+                );
+            } else {
+                await signInWithEmailAndPassword(auth, email.trim(), password);
+            }
         } catch (e) {
-            Alert.alert('Error sending OTP', e.message);
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    const handleVerifyOtp = async () => {
-        if (!otp || otp.length < 6) {
-            Alert.alert('Error', 'Please enter the 6-digit code sent to your phone.');
-            return;
-        }
-        setLoading(true);
-        try {
-            const userCred = await confirmation.confirm(otp);
-            await setDoc(doc(db, 'users', userCred.user.uid), {
-                role: 'MECHANIC',
-                phone: userCred.user.phoneNumber,
-                isVerified: true,
-                createdAt: new Date(),
-            }, { merge: true });
-        } catch (e) {
-            Alert.alert('Invalid OTP', 'The code you entered is incorrect. Please try again.');
+            Alert.alert('Authentication Failed', e.message);
         } finally {
             setLoading(false);
         }
@@ -73,12 +66,6 @@ export default function LoginScreen() {
 
     return (
         <View style={styles.container}>
-            <FirebaseRecaptchaVerifierModal
-                ref={recaptchaVerifier}
-                firebaseConfig={firebaseConfig}
-                attemptInvisibleVerification={true}
-            />
-
             <View style={styles.logoContainer}>
                 <View style={styles.row}>
                     <Siren size={28} color={theme.amber} />
@@ -92,13 +79,13 @@ export default function LoginScreen() {
                     <Text style={styles.roleLabel}>I AM A:</Text>
                     <View style={styles.roleTabs}>
                         <TouchableOpacity
-                            onPress={() => { setRole('CUSTOMER'); setConfirmation(null); }}
+                            onPress={() => setRole('CUSTOMER')}
                             style={[styles.roleTab, role === 'CUSTOMER' && styles.roleTabActive]}
                         >
                             <Text style={[styles.roleTabText, role === 'CUSTOMER' && styles.roleTabTextActive]}>Driver</Text>
                         </TouchableOpacity>
                         <TouchableOpacity
-                            onPress={() => { setRole('MECHANIC'); setConfirmation(null); }}
+                            onPress={() => setRole('MECHANIC')}
                             style={[styles.roleTab, role === 'MECHANIC' && styles.roleTabActive]}
                         >
                             <Text style={[styles.roleTabText, role === 'MECHANIC' && styles.roleTabTextActive]}>Mechanic</Text>
@@ -117,44 +104,36 @@ export default function LoginScreen() {
                     </View>
                 ) : (
                     <View style={{ marginTop: 12 }}>
-                        {!confirmation ? (
-                            <>
-                                <Text style={[styles.roleLabel, { textAlign: 'left' }]}>MOBILE NUMBER</Text>
-                                <TextInput
-                                    style={styles.input}
-                                    placeholder="09XX XXX XXXX"
-                                    placeholderTextColor={theme.textFaint}
-                                    keyboardType="phone-pad"
-                                    value={phone}
-                                    onChangeText={setPhone}
-                                />
-                                <TouchableOpacity style={styles.primaryBtn} onPress={handleSendOtp} disabled={loading || !phone}>
-                                    {loading ? <ActivityIndicator color={theme.bg} /> : <Text style={styles.primaryBtnText}>Send Verification Code</Text>}
-                                </TouchableOpacity>
-                            </>
-                        ) : (
-                            <>
-                                <Text style={[styles.roleLabel, { textAlign: 'left' }]}>ENTER 6-DIGIT OTP</Text>
-                                <TextInput
-                                    style={styles.input}
-                                    placeholder="_ _ _ _ _ _"
-                                    placeholderTextColor={theme.textFaint}
-                                    keyboardType="number-pad"
-                                    value={otp}
-                                    onChangeText={setOtp}
-                                    maxLength={6}
-                                />
-                                <Text style={[styles.subtitle, { marginTop: 4, marginBottom: 16 }]}>
-                                    Code sent to {phone}
-                                </Text>
-                                <TouchableOpacity style={styles.primaryBtn} onPress={handleVerifyOtp} disabled={loading || otp.length < 6}>
-                                    {loading ? <ActivityIndicator color={theme.bg} /> : <Text style={styles.primaryBtnText}>Verify & Login</Text>}
-                                </TouchableOpacity>
-                                <TouchableOpacity style={styles.switchBtn} onPress={() => setConfirmation(null)}>
-                                    <Text style={styles.switchBtnText}>← Different number</Text>
-                                </TouchableOpacity>
-                            </>
-                        )}
+                        <Text style={[styles.roleLabel, { textAlign: 'left' }]}>EMAIL ADDRESS</Text>
+                        <TextInput
+                            style={styles.input}
+                            placeholder="mechanic@email.com"
+                            placeholderTextColor={theme.textFaint}
+                            keyboardType="email-address"
+                            autoCapitalize="none"
+                            value={email}
+                            onChangeText={setEmail}
+                        />
+
+                        <Text style={[styles.roleLabel, { textAlign: 'left', marginTop: 8 }]}>PASSWORD</Text>
+                        <TextInput
+                            style={[styles.input, { letterSpacing: 1 }]}
+                            placeholder="••••••••"
+                            placeholderTextColor={theme.textFaint}
+                            secureTextEntry={true}
+                            value={password}
+                            onChangeText={setPassword}
+                        />
+
+                        <TouchableOpacity style={styles.primaryBtn} onPress={handleEmailAuth} disabled={loading || !email || !password}>
+                            {loading ? <ActivityIndicator color={theme.bg} /> : <Text style={styles.primaryBtnText}>{isRegistering ? 'Register Account' : 'Login'}</Text>}
+                        </TouchableOpacity>
+
+                        <TouchableOpacity style={styles.switchBtn} onPress={() => setIsRegistering(!isRegistering)}>
+                            <Text style={styles.switchBtnText}>
+                                {isRegistering ? 'Already have an account? Log in' : 'No account? Register here'}
+                            </Text>
+                        </TouchableOpacity>
                     </View>
                 )}
             </View>

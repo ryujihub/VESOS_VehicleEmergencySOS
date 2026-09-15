@@ -1,14 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, Platform } from 'react-native';
-import { Siren, PhoneCall, MessageSquareWarning, MapPin, Car as CarIcon, CheckCircle2, Clock, Wrench, ChevronRight, Battery, Fuel, KeyRound, CircleDot, Camera } from 'lucide-react-native';
+import { View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, Platform, Linking, Alert } from 'react-native';
+import { Siren, PhoneCall, MessageSquareWarning, MapPin, Car as CarIcon, CheckCircle2, Clock, Wrench, ChevronRight, Battery, Fuel, KeyRound, CircleDot, Camera, LogOut } from 'lucide-react-native';
+import { signOut } from 'firebase/auth';
 import * as Location from 'expo-location';
 import * as SMS from 'expo-sms';
 import * as ImagePicker from 'expo-image-picker';
-import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps';
+import VehicleMap from '../components/VehicleMap';
 import { auth, db, storage } from '../../firebaseConfig';
-import { collection, addDoc, serverTimestamp, doc, onSnapshot } from 'firebase/firestore';
+import { collection, addDoc, serverTimestamp, doc, onSnapshot, getDoc, updateDoc, query, where } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { theme, fonts } from '../theme/theme';
+import { haversineKm } from '../lib/geo';
 
 const ISSUES = [
   { key: "battery", label: "Dead battery", icon: Battery },
@@ -96,16 +98,42 @@ export default function CustomerDashboard() {
   const [issueDetails, setIssueDetails] = useState("");
   const [plate, setPlate] = useState("");
   const [vehicleInfo, setVehicleInfo] = useState("");
+  const [contactNumber, setContactNumber] = useState("");
   const [notifyContact, setNotifyContact] = useState(true);
   
   const [stepIndex, setStepIndex] = useState(0);
   const [smsStatus, setSmsStatus] = useState("idle");
   const [currentRequestId, setCurrentRequestId] = useState(null);
+  const [mechanicInfo, setMechanicInfo] = useState(null);
+  const [mechanicLoc, setMechanicLoc] = useState(null);
+  const [requestLoc, setRequestLoc] = useState(null);
   const [photo, setPhoto] = useState(null);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [initialLocation, setInitialLocation] = useState(null);
   const [addressText, setAddressText] = useState("Fetching location...");
   const timers = useRef([]);
+
+  // Resume an in-progress emergency after a reload/app restart — a driver
+  // must never lose their tracking screen mid-SOS. (Unindexed single-field
+  // query; active filtering + ordering done client-side.)
+  useEffect(() => {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
+    const q = query(collection(db, 'serviceRequests'), where("customerId", "==", uid));
+    const unsub = onSnapshot(q, (snapshot) => {
+      if (currentRequestId) return; // already tracking something
+      const ACTIVE = ["PENDING", "ACCEPTED", "ENROUTE", "ARRIVED"];
+      const active = snapshot.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .filter((r) => ACTIVE.includes(r.status))
+        .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+      if (active.length > 0) {
+        setCurrentRequestId(active[0].id);
+        setPhase("tracking");
+      }
+    });
+    return () => unsub();
+  }, [currentRequestId]);
 
   useEffect(() => {
     (async () => {
@@ -133,9 +161,27 @@ export default function CustomerDashboard() {
 
   useEffect(() => {
     if (currentRequestId) {
-      const unsub = onSnapshot(doc(db, 'serviceRequests', currentRequestId), (snapshot) => {
+      const unsub = onSnapshot(doc(db, 'serviceRequests', currentRequestId), async (snapshot) => {
         const data = snapshot.data();
         if (data) {
+          // Look up the accepted mechanic's profile so the tracking screen can
+          // show real name/shop and a tappable call button.
+          if (data.mechanicId) {
+            getDoc(doc(db, 'users', data.mechanicId))
+              .then((m) => m.exists() && setMechanicInfo({ id: m.id, ...m.data() }))
+              .catch((e) => console.warn('Mechanic lookup failed:', e));
+          }
+          // Mechanic's live position, normalized to {latitude, longitude}.
+          setMechanicLoc(
+            data.mechanicLocation
+              ? { latitude: data.mechanicLocation.lat, longitude: data.mechanicLocation.lng }
+              : null
+          );
+          // Where the SOS came from — anchors the tracking map even if the
+          // device can't provide live GPS later.
+          if (data.location) {
+            setRequestLoc({ latitude: data.location.lat, longitude: data.location.lng });
+          }
           if (data.status === 'PENDING') setStepIndex(0);
           else if (data.status === 'ACCEPTED') setStepIndex(2);
           else if (data.status === 'ENROUTE') setStepIndex(3);
@@ -158,15 +204,19 @@ export default function CustomerDashboard() {
     setIssueDetails("");
     setPlate("");
     setVehicleInfo("");
+    setContactNumber("");
     setStepIndex(0);
     setSmsStatus("idle");
     setCurrentRequestId(null);
     setPhoto(null);
+    setMechanicInfo(null);
+    setMechanicLoc(null);
+    setRequestLoc(null);
   };
 
   const takePhoto = async () => {
     let result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: ['images'],
       allowsEditing: true,
       quality: 0.5,
     });
@@ -177,13 +227,32 @@ export default function CustomerDashboard() {
 
   const sendSOS = async () => {
     try {
+        // An emergency must never silently fail: if location is unavailable,
+        // fall back to a coarse area so the SOS still goes out and mechanics
+        // can still call the driver.
         let { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== 'granted') {
-            console.log('Permission to access location was denied');
-            return;
+        let location = null;
+        if (status === 'granted') {
+            try {
+                location = await Location.getCurrentPositionAsync({});
+            } catch (locErr) {
+                console.log('Position fetch failed:', locErr);
+            }
         }
-
-        let location = await Location.getCurrentPositionAsync({});
+        if (!location) {
+            try {
+                const last = await Location.getLastKnownPositionAsync();
+                if (last) location = last;
+            } catch (e) {}
+        }
+        if (!location) {
+            // Metro Manila approximation so the request is still usable.
+            location = { coords: { latitude: 14.5995, longitude: 120.9842 } };
+            Alert.alert(
+                'Location unavailable',
+                "We couldn't get your precise GPS position. The request was sent with an approximate area — tell the mechanic your location when they call."
+            );
+        }
         
         setUploadingImage(true);
         let imageUrl = null;
@@ -201,13 +270,27 @@ export default function CustomerDashboard() {
         setUploadingImage(false);
         
         try {
+            // Optional: include the driver's registered name so the mechanic
+            // sees who they're calling.
+            let customerName = null;
+            if (auth.currentUser) {
+                try {
+                    const profileSnap = await getDoc(doc(db, 'users', auth.currentUser.uid));
+                    if (profileSnap.exists()) customerName = profileSnap.data().name || null;
+                } catch (e) {
+                    console.log('Profile lookup failed:', e);
+                }
+            }
+
             const docRef = await addDoc(collection(db, 'serviceRequests'), {
                 customerId: auth.currentUser?.uid || 'guest',
+                contactName: customerName,
                 status: 'PENDING',
                 issueType: issue,
                 issueDetails,
                 plate,
                 vehicleInfo,
+                contactNumber: contactNumber.trim(),
                 location: {
                     lat: location.coords.latitude,
                     lng: location.coords.longitude
@@ -237,6 +320,7 @@ export default function CustomerDashboard() {
 
     } catch (err) {
         console.error("Error", err.message);
+        Alert.alert('Something went wrong', 'Your SOS could not be sent. Please try again or call the hotline.');
     }
   };
 
@@ -247,7 +331,15 @@ export default function CustomerDashboard() {
       {phase === "form" && (
         <ScrollView style={styles.flex1} contentContainerStyle={{ paddingBottom: 20 }}>
           <View style={styles.headerArea}>
-            <Text style={styles.title}>Vehicle trouble?</Text>
+            <View style={styles.rowBetween}>
+              <Text style={styles.title}>Vehicle trouble?</Text>
+              <TouchableOpacity
+                onPress={() => signOut(auth).catch((e) => console.warn('Sign out failed:', e))}
+                style={styles.signOutBtn}
+              >
+                <LogOut size={15} color={theme.textFaint} />
+              </TouchableOpacity>
+            </View>
             <Text style={styles.subtitle}>Kailangan mo ng tulong? Tell us what's wrong and where you are.</Text>
           </View>
 
@@ -304,6 +396,18 @@ export default function CustomerDashboard() {
           </View>
 
           <View style={styles.section}>
+            <Text style={styles.label}>CONTACT NUMBER (OPTIONAL)</Text>
+            <TextInput
+              style={styles.input}
+              value={contactNumber}
+              onChangeText={(text) => setContactNumber(text.replace(/[^0-9+]/g, ''))}
+              placeholder="0917 123 4567"
+              placeholderTextColor={theme.textFaint}
+              keyboardType="phone-pad"
+            />
+          </View>
+
+          <View style={styles.section}>
             <Text style={styles.label}>VEHICLE TYPE & COLOR</Text>
             <TextInput
               style={styles.input}
@@ -319,20 +423,12 @@ export default function CustomerDashboard() {
               <MapPin size={15} color={theme.textMuted} />
               <Text style={styles.locationText}>{addressText}</Text>
             </View>
-            {Platform.OS !== 'web' && initialLocation && (
+            {initialLocation && (
               <View style={{ marginTop: 12, height: 120, borderRadius: 8, overflow: 'hidden' }}>
-                <MapView 
-                  provider={PROVIDER_GOOGLE}
-                  style={{ flex: 1 }} 
-                  initialRegion={{
-                    latitude: initialLocation.latitude,
-                    longitude: initialLocation.longitude,
-                    latitudeDelta: 0.005,
-                    longitudeDelta: 0.005,
-                  }}
-                >
-                  <Marker coordinate={initialLocation} />
-                </MapView>
+                <VehicleMap
+                  initialLocation={initialLocation}
+                  addressText={addressText}
+                />
               </View>
             )}
           </View>
@@ -394,6 +490,29 @@ export default function CustomerDashboard() {
           <ScrollView style={styles.flex1}>
             <StepTracker currentIndex={stepIndex} />
             
+            {stepIndex >= 2 && requestLoc && (
+              <View style={{ paddingHorizontal: 20, marginBottom: 20 }}>
+                <View style={{ height: 170, borderRadius: 8, overflow: 'hidden', borderWidth: 1, borderColor: theme.border }}>
+                  <VehicleMap
+                    initialLocation={requestLoc}
+                    customerLocation={requestLoc}
+                    mechanicLocation={mechanicLoc}
+                    showLiveTracking
+                    distanceKm={
+                      mechanicLoc
+                        ? haversineKm(requestLoc.latitude, requestLoc.longitude, mechanicLoc.latitude, mechanicLoc.longitude).toFixed(1)
+                        : null
+                    }
+                  />
+                </View>
+                <Text style={styles.distanceText}>
+                  {mechanicLoc
+                    ? `Your mechanic is ${haversineKm(requestLoc.latitude, requestLoc.longitude, mechanicLoc.latitude, mechanicLoc.longitude).toFixed(1)} km away · updates live`
+                    : 'Waiting for your mechanic to share their location…'}
+                </Text>
+              </View>
+            )}
+
             {stepIndex >= 2 && (
               <View style={{ paddingHorizontal: 20, marginBottom: 20 }}>
                 <View style={styles.mechanicBox}>
@@ -401,16 +520,36 @@ export default function CustomerDashboard() {
                     <Wrench size={18} color={theme.amber} />
                   </View>
                   <View style={styles.flex1}>
-                    <Text style={styles.mechanicName}>Kuya Mando's Auto Repair</Text>
-                    <Text style={styles.mechanicSub}>2.3 km away · ★ 4.8</Text>
+                    <Text style={styles.mechanicName}>
+                      {mechanicInfo?.shopName || mechanicInfo?.name || 'Finding your mechanic…'}
+                    </Text>
+                    <Text style={styles.mechanicSub}>
+                      {mechanicInfo?.name || 'Mechanic'}
+                      {mechanicInfo?.idUrl ? ' · ID verified' : ''}
+                    </Text>
                   </View>
-                  <PhoneCall size={17} color={theme.textMuted} />
+                  {mechanicInfo?.contactNumber ? (
+                    <TouchableOpacity onPress={() => Linking.openURL(`tel:${mechanicInfo.contactNumber}`)}>
+                      <PhoneCall size={17} color={theme.amber} />
+                    </TouchableOpacity>
+                  ) : (
+                    <PhoneCall size={17} color={theme.textFaint} />
+                  )}
                 </View>
               </View>
             )}
             
             <View style={{ paddingHorizontal: 20, paddingVertical: 20 }}>
-              <TouchableOpacity onPress={reset} style={styles.cancelBtn}>
+              <TouchableOpacity
+                onPress={() => {
+                  if (currentRequestId) {
+                    updateDoc(doc(db, 'serviceRequests', currentRequestId), { status: 'CANCELLED' })
+                      .catch((e) => console.warn('Cancel failed:', e));
+                  }
+                  reset();
+                }}
+                style={styles.cancelBtn}
+              >
                 <Text style={styles.cancelBtnText}>Cancel request</Text>
               </TouchableOpacity>
             </View>
@@ -486,7 +625,8 @@ export default function CustomerDashboard() {
           </View>
           <Text style={styles.trackingTitle}>Service completed</Text>
           <Text style={[styles.smsDesc, { textAlign: 'center' }]}>
-            Kuya Mando's Auto Repair replaced your battery. Total: ₱1,850
+            {mechanicInfo?.shopName || mechanicInfo?.name || 'Your mechanic'} completed the job.
+            {mechanicInfo?.contactNumber ? ` Questions? Call ${mechanicInfo.shopName || mechanicInfo.name} at ${mechanicInfo.contactNumber}.` : ''}
           </Text>
           <TouchableOpacity onPress={reset} style={styles.doneBtn}>
             <Text style={styles.doneBtnText}>Done</Text>
@@ -503,6 +643,7 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   headerArea: { paddingHorizontal: 20, paddingTop: 20, paddingBottom: 8 },
+  signOutBtn: { borderWidth: 1, borderColor: theme.border, borderRadius: 16, padding: 7 },
   title: { fontFamily: fonts.displayBold, fontSize: 21, color: theme.text },
   subtitle: { fontFamily: fonts.body, fontSize: 13, color: theme.textMuted, marginTop: 4 },
   section: { paddingHorizontal: 20, marginTop: 16 },
@@ -579,6 +720,7 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   mechanicIconBox: { width: 40, height: 40, borderRadius: 6, backgroundColor: theme.raised, alignItems: 'center', justifyContent: 'center' },
+  distanceText: { fontFamily: fonts.body, fontSize: 11.5, color: theme.textMuted, marginTop: 8 },
   mechanicName: { fontFamily: fonts.bodySemibold, fontSize: 13.5, color: theme.text },
   mechanicSub: { fontFamily: fonts.body, fontSize: 11.5, color: theme.textMuted },
   cancelBtn: {

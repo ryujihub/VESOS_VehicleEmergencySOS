@@ -1,9 +1,12 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Image } from 'react-native';
-import { MapPin, Siren, Car as CarIcon, CheckCircle2, Navigation, PhoneCall } from 'lucide-react-native';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Image, Linking, Alert } from 'react-native';
+import { MapPin, Siren, Car as CarIcon, CheckCircle2, Navigation, PhoneCall, LogOut } from 'lucide-react-native';
 import { theme, fonts } from '../theme/theme';
 import { collection, onSnapshot, query, where, doc, updateDoc, getDoc } from 'firebase/firestore';
+import { signOut } from 'firebase/auth';
 import { auth, db } from '../../firebaseConfig';
+import * as Location from 'expo-location';
+import { haversineKm } from '../lib/geo';
 
 export default function MechanicDashboard() {
   const [online, setOnline] = useState(true);
@@ -12,6 +15,19 @@ export default function MechanicDashboard() {
   const [requestData, setRequestData] = useState(null);
   const [mechanicName, setMechanicName] = useState('Mechanic');
   const [shopName, setShopName] = useState('Your Shop');
+  const [sharingLocation, setSharingLocation] = useState(false);
+  const [locationError, setLocationError] = useState(null);
+  const lastWriteRef = useRef({ at: 0, lat: null, lng: null });
+
+  // Mirror of `request` that listeners can read synchronously. Firestore's
+  // local-cache snapshots can fire before React commits a state update (e.g.
+  // the PENDING query emptying right after Accept), and stale closures were
+  // clearing requestData mid-accept — leaving the "Issue · undefined" card.
+  const requestRef = useRef(null);
+  const updateRequest = useCallback((value) => {
+    requestRef.current = value;
+    setRequest(value);
+  }, []);
 
   useEffect(() => {
     const uid = auth.currentUser?.uid;
@@ -24,46 +40,138 @@ export default function MechanicDashboard() {
     });
   }, []);
 
+  // Resume any in-progress job on mount — otherwise a mechanic who accepted a
+  // job and reloads/app-switches loses it, and the customer is stuck forever
+  // at "mechanic accepted".
+  useEffect(() => {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
+    const q = query(
+      collection(db, 'serviceRequests'),
+      where("mechanicId", "==", uid),
+      where("status", "in", ["ACCEPTED", "ENROUTE", "ARRIVED"])
+    );
+    const unsubResume = onSnapshot(q, (snapshot) => {
+      if (!snapshot.empty && requestRef.current === null) {
+        const reqDoc = snapshot.docs[0];
+        const statusMap = { ACCEPTED: "accepted", ENROUTE: "enroute", ARRIVED: "arrived" };
+        setRequestData({ id: reqDoc.id, ...reqDoc.data() });
+        setJobStatus(statusMap[reqDoc.data().status] || "accepted");
+        updateRequest("accepted");
+      }
+    });
+    return () => unsubResume();
+  }, [updateRequest]);
+
   useEffect(() => {
     let unsub = () => {};
     if (online) {
       const q = query(collection(db, 'serviceRequests'), where("status", "==", "PENDING"));
       unsub = onSnapshot(q, (snapshot) => {
         if (!snapshot.empty) {
-          if (request !== "accepted") {
+          if (requestRef.current !== "accepted") {
             const reqDoc = snapshot.docs[0];
             setRequestData({ id: reqDoc.id, ...reqDoc.data() });
-            setRequest("incoming");
+            updateRequest("incoming");
           }
         } else {
-          if (request === "incoming") {
-            setRequest(null);
+          if (requestRef.current === "incoming") {
+            updateRequest(null);
             setRequestData(null);
           }
         }
       });
     } else {
-       if (request === "incoming") {
-         setRequest(null);
+       if (requestRef.current === "incoming") {
+         updateRequest(null);
          setRequestData(null);
        }
     }
     return () => unsub();
-  }, [online, request]);
+  }, [online, updateRequest]);
+
+  const number = requestData?.contactNumber || null;
+  const name = requestData?.contactName || null;
+  const numberColor = number ? theme.amber : theme.textFaint;
+
+  const callCustomer = () => {
+    if (number) {
+      Linking.openURL(`tel:${number.replace(/[^0-9+]/g, '')}`);
+    } else {
+      Alert.alert('No contact number', 'This driver did not leave a contact number.');
+    }
+  };
+
+  // Share the mechanic's live position while a job is active. Firestore
+  // writes are throttled to 5s or 150m of movement — enough for a smooth
+  // customer-side tracker without hammering the database.
+  useEffect(() => {
+    const activeJob = request === "accepted" && requestData?.id;
+    if (!activeJob || !online) {
+      setSharingLocation(false);
+      return;
+    }
+    let watchId = null;
+    let cancelled = false;
+    const requestId = requestData.id;
+
+    (async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted' || cancelled) {
+          setLocationError('Location permission needed for live tracking');
+          return;
+        }
+        setLocationError(null);
+        watchId = await Location.watchPositionAsync(
+          { accuracy: Location.Accuracy.Balanced, timeInterval: 4000, distanceInterval: 25 },
+          async (pos) => {
+            const { latitude, longitude } = pos.coords;
+            const last = lastWriteRef.current;
+            const movedM = last.lat == null
+              ? Infinity
+              : haversineKm(last.lat, last.lng, latitude, longitude) * 1000;
+            const stale = Date.now() - last.at > 5000;
+            if (!stale && movedM < 150) return;
+            lastWriteRef.current = { at: Date.now(), lat: latitude, lng: longitude };
+            try {
+              await updateDoc(doc(db, 'serviceRequests', requestId), {
+                mechanicLocation: { lat: latitude, lng: longitude },
+                mechanicLocationAt: new Date(),
+              });
+            } catch (e) {
+              console.warn('Location share failed:', e);
+            }
+          }
+        );
+        if (!cancelled) setSharingLocation(true);
+      } catch (e) {
+        if (!cancelled) setLocationError('Could not start location sharing');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      setSharingLocation(false);
+      if (watchId) watchId.remove();
+    };
+  }, [request, requestData?.id, online]);
 
   const accept = async () => {
     if (requestData) {
+      // Optimistic, synchronous: stops the PENDING listener from clearing
+      // requestData when the accept write empties its query.
+      updateRequest("accepted");
+      setJobStatus("accepted");
       await updateDoc(doc(db, 'serviceRequests', requestData.id), {
           status: 'ACCEPTED',
           mechanicId: auth.currentUser?.uid || 'guest-mech'
       });
-      setRequest("accepted");
-      setJobStatus("accepted");
     }
   };
 
   const decline = () => {
-    setRequest(null);
+    updateRequest(null);
     setRequestData(null);
   };
 
@@ -82,7 +190,7 @@ export default function MechanicDashboard() {
       
       if (nextJobStatus === "done") {
         setTimeout(() => {
-          setRequest(null);
+          updateRequest(null);
           setJobStatus("accepted");
           setRequestData(null);
         }, 2200);
@@ -97,21 +205,29 @@ export default function MechanicDashboard() {
           <Text style={styles.shopName}>{shopName}</Text>
           <Text style={styles.shopLocation}>{mechanicName}</Text>
         </View>
-        <TouchableOpacity
-          onPress={() => setOnline(!online)}
-          style={[
-            styles.toggleBtn,
-            {
-              backgroundColor: online ? theme.greenDim : theme.surfaceAlt,
-              borderColor: online ? theme.green : theme.border,
-            }
-          ]}
-        >
-          <View style={[styles.indicator, { backgroundColor: online ? theme.green : theme.textFaint }]} />
-          <Text style={[styles.toggleText, { color: online ? theme.green : theme.textMuted }]}>
-            {online ? "Online" : "Offline"}
-          </Text>
-        </TouchableOpacity>
+        <View style={styles.row}>
+          <TouchableOpacity
+            onPress={() => setOnline(!online)}
+            style={[
+              styles.toggleBtn,
+              {
+                backgroundColor: online ? theme.greenDim : theme.surfaceAlt,
+                borderColor: online ? theme.green : theme.border,
+              }
+            ]}
+          >
+            <View style={[styles.indicator, { backgroundColor: online ? theme.green : theme.textFaint }]} />
+            <Text style={[styles.toggleText, { color: online ? theme.green : theme.textMuted }]}>
+              {online ? "Online" : "Offline"}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => signOut(auth).catch((e) => console.warn('Sign out failed:', e))}
+            style={styles.signOutBtn}
+          >
+            <LogOut size={15} color={theme.textFaint} />
+          </TouchableOpacity>
+        </View>
       </View>
 
       {!request && (
@@ -144,6 +260,9 @@ export default function MechanicDashboard() {
               )}
               <Text style={styles.issueSub}>{requestData?.vehicleInfo ? `${requestData.vehicleInfo} · ` : ''}Plate {requestData?.plate}</Text>
               <Text style={styles.issueSub}>{requestData?.location ? `GPS: ${requestData.location.lat.toFixed(4)}, ${requestData.location.lng.toFixed(4)}` : 'Location active'}</Text>
+              {requestData?.contactNumber && (
+                <Text style={styles.issueSub}>Contact: {requestData.contactNumber}</Text>
+              )}
               {requestData?.imageUrl && (
                 <Image source={{ uri: requestData.imageUrl }} style={styles.requestImage} />
               )}
@@ -175,8 +294,17 @@ export default function MechanicDashboard() {
             )}
             <View style={[styles.row, { marginTop: 8 }]}>
               <MapPin size={14} color={theme.textMuted} />
-              <Text style={styles.jobSub}>{requestData?.location ? `GPS: ${requestData.location.lat.toFixed(4)}, ${requestData.location.lng.toFixed(4)}` : 'Active Route'} · Maps Available</Text>
+              <Text style={styles.jobSub}>
+                {requestData?.location ? `Customer GPS: ${requestData.location.lat.toFixed(4)}, ${requestData.location.lng.toFixed(4)}` : 'Active Route'}
+                {' · '}{sharingLocation ? 'Sharing live location' : locationError || 'Location sharing off'}
+              </Text>
             </View>
+            {!!requestData?.contactNumber && (
+              <View style={[styles.row, { marginTop: 4 }]}>
+                <PhoneCall size={13} color={theme.textMuted} />
+                <Text style={styles.jobSub}>{requestData.contactName ? `${requestData.contactName} · ` : ''}{requestData.contactNumber}</Text>
+              </View>
+            )}
             {requestData?.imageUrl && (
               <Image source={{ uri: requestData.imageUrl }} style={styles.jobImage} />
             )}
@@ -204,9 +332,11 @@ export default function MechanicDashboard() {
                   </Text>
                 </TouchableOpacity>
 
-                <TouchableOpacity style={styles.callBtn}>
-                  <PhoneCall size={14} color={theme.textMuted} />
-                  <Text style={styles.callText}>Call customer</Text>
+                <TouchableOpacity style={styles.callBtn} onPress={callCustomer}>
+                  <PhoneCall size={14} color={numberColor} />
+                  <Text style={[styles.callText, number ? { color: numberColor } : {}]}>
+                    {number ? `Call ${name || 'customer'}` : 'No contact number left'}
+                  </Text>
                 </TouchableOpacity>
               </View>
             )}
@@ -235,6 +365,14 @@ const styles = StyleSheet.create({
   },
   indicator: { width: 7, height: 7, borderRadius: 4 },
   toggleText: { fontFamily: fonts.bodySemibold, fontSize: 11.5 },
+  signOutBtn: {
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 20,
+    padding: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   centerContainer: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 32 },
   statusText: { fontFamily: fonts.body, fontSize: 13.5, color: theme.textMuted, marginTop: 12, textAlign: 'center' },
   demoBtn: { marginTop: 20, backgroundColor: theme.surfaceAlt, borderWidth: 1, borderColor: theme.borderStrong, borderStyle: 'dashed', borderRadius: 8, paddingHorizontal: 16, paddingVertical: 10 },
