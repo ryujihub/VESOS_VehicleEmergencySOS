@@ -8,6 +8,7 @@ import { auth, db } from '../../firebaseConfig';
 import * as Location from 'expo-location';
 import { haversineKm } from '../lib/geo';
 import { ConnectivityBanner } from '../components/ConnectivityBanner';
+import { registerMechanicPush, ensureAndroidSosChannel } from '../lib/push';
 
 export default function MechanicDashboard() {
   const [online, setOnline] = useState(true);
@@ -39,6 +40,10 @@ export default function MechanicDashboard() {
         setShopName(snap.data().shopName || 'Your Shop');
       }
     });
+    // Push registration: this is what makes the phone alert with the app
+    // CLOSED. Best-effort — a failure never blocks the dashboard.
+    registerMechanicPush().then((t) => t && console.log('SOS push registered'));
+    ensureAndroidSosChannel();
   }, []);
 
   // Resume any in-progress job on mount — otherwise a mechanic who accepted a
@@ -265,8 +270,10 @@ export default function MechanicDashboard() {
               {requestData?.contactNumber && (
                 <Text style={styles.issueSub}>Contact: {requestData.contactNumber}</Text>
               )}
-              {requestData?.imageUrl && (
+              {requestData?.imageUrl ? (
                 <Image source={{ uri: requestData.imageUrl }} style={styles.requestImage} />
+              ) : (
+                <Text style={styles.noPhotoText}>No problem photo attached</Text>
               )}
             </View>
           </View>
@@ -400,5 +407,6 @@ const styles = StyleSheet.create({
   callBtn: { marginTop: 10, borderWidth: 1, borderColor: theme.border, borderRadius: 8, paddingVertical: 11, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 },
   callText: { fontFamily: fonts.body, fontSize: 13, color: theme.textMuted },
   requestImage: { width: '100%', height: 120, borderRadius: 8, marginTop: 12, backgroundColor: theme.surfaceAlt },
+  noPhotoText: { fontFamily: fonts.body, fontSize: 12, color: theme.textFaint, marginTop: 12, fontStyle: 'italic' },
   jobImage: { width: '100%', height: 120, borderRadius: 8, marginTop: 12, backgroundColor: theme.raised }
 });

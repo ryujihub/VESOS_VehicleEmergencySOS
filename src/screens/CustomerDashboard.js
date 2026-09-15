@@ -13,6 +13,7 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { theme, fonts } from '../theme/theme';
 import { haversineKm } from '../lib/geo';
 import { ConnectivityBanner } from '../components/ConnectivityBanner';
+import { pushSosToMechanics } from '../lib/push';
 
 const ISSUES = [
   { key: "battery", label: "Dead battery", icon: Battery },
@@ -402,6 +403,15 @@ export default function CustomerDashboard() {
             setCurrentRequestId(docRef.id);
             setPhase("tracking");
             setStepIndex(0);
+
+            // Fire-and-forget push fan-out: alert every registered mechanic
+            // device even when the VESOS app is closed. Never blocks the SOS.
+            pushSosToMechanics({
+              issueLabel: issue ? ISSUES.find((i) => i.key === issue)?.label.toUpperCase() : 'VEHICLE TROUBLE',
+              plate,
+              vehicleInfo,
+              mapsLink: `https://maps.google.com/?q=${location.coords.latitude},${location.coords.longitude}`,
+            }).catch(() => {});
 
         } catch (firebaseErr) {
             console.log("Firebase write timed out or failed — escalating to SMS:", firebaseErr);
