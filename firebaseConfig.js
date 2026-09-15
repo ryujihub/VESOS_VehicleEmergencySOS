@@ -1,5 +1,5 @@
 import { initializeApp } from "firebase/app";
-import { getFirestore } from "firebase/firestore";
+import { getFirestore, initializeFirestore, persistentLocalCache, persistentSingleTabManager, memoryLocalCache } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
 import { initializeAuth, getReactNativePersistence, getAuth } from "firebase/auth";
 import ReactNativeAsyncStorage from '@react-native-async-storage/async-storage';
@@ -16,10 +16,33 @@ export const firebaseConfig = {
 
 export const app = initializeApp(firebaseConfig);
 
-// Initialize Cloud Firestore and Authentication with AsyncStorage Persistence
-export const db = getFirestore(app);
+// Firestore cache strategy:
+// - Web: persistent cache (IndexedDB), single tab forced — a queued SOS write
+//   survives a tab/app kill and resumes when connectivity returns. (This is a
+//   phone app in practice; multi-tab coordination only adds failure modes.)
+// - Native: the JS SDK has no IndexedDB (open feature request), so fall back
+//   to the memory cache. Offline safety on device comes from the SOS write
+//   timeout + SMS escalation path instead.
+export let db;
+if (Platform.OS === 'web') {
+  try {
+    db = initializeFirestore(app, {
+      localCache: persistentLocalCache({
+        tabManager: persistentSingleTabManager({ forceOwnership: true }),
+      }),
+    });
+  } catch (e) {
+    // e.g. IndexedDB unavailable in this browser context (private mode, iframe)
+    console.warn('Persistent Firestore cache unavailable, using memory cache:', e);
+    db = getFirestore(app);
+  }
+} else {
+  db = getFirestore(app);
+}
+
 export const storage = getStorage(app);
-export const auth = Platform.OS === 'web' 
+
+export const auth = Platform.OS === 'web'
   ? getAuth(app)
   : initializeAuth(app, {
       persistence: getReactNativePersistence(ReactNativeAsyncStorage)

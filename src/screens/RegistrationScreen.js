@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ActivityIndicator, ScrollView, Image } from 'react-native';
-import { doc, updateDoc } from 'firebase/firestore';
+import { doc, setDoc } from 'firebase/firestore';
+import { signOut } from 'firebase/auth';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import * as ImagePicker from 'expo-image-picker';
 import { auth, db, storage } from '../../firebaseConfig';
 import { theme, fonts } from '../theme/theme';
-import { Siren, Camera, User, Wrench, Phone } from 'lucide-react-native';
+import { Siren, Camera, User, Wrench, Phone, LogOut } from 'lucide-react-native';
 
 export default function RegistrationScreen({ role }) {
   const [fullName, setFullName] = useState('');
@@ -54,12 +55,16 @@ export default function RegistrationScreen({ role }) {
         }
       }
 
-      await updateDoc(doc(db, 'users', uid), {
+      // setDoc+merge instead of updateDoc: if the original registration doc
+      // write failed (e.g. network dropped mid-signup), this recreates it
+      // instead of failing forever with "No document to update".
+      await setDoc(doc(db, 'users', uid), {
         name: fullName.trim(),
+        role: role || (auth.currentUser?.isAnonymous ? 'CUSTOMER' : 'MECHANIC'),
         ...(role === 'MECHANIC' && { shopName: shopName.trim(), contactNumber: contactNumber.trim() }),
         ...(idUrl && { idUrl }),
         isSetupComplete: true,
-      });
+      }, { merge: true });
     } catch (e) {
       Alert.alert('Error', e.message);
     } finally {
@@ -70,9 +75,17 @@ export default function RegistrationScreen({ role }) {
   return (
     <ScrollView style={styles.container} contentContainerStyle={{ paddingBottom: 40 }}>
       <View style={styles.header}>
-        <View style={styles.row}>
-          <Siren size={22} color={theme.amber} />
-          <Text style={styles.title}>AyudaAuto</Text>
+        <View style={[styles.row, styles.headerRow]}>
+          <View style={styles.row}>
+            <Siren size={22} color={theme.amber} />
+            <Text style={styles.title}>AyudaAuto</Text>
+          </View>
+          <TouchableOpacity
+            onPress={() => signOut(auth).catch((e) => console.warn('Sign out failed:', e))}
+            style={styles.signOutBtn}
+          >
+            <LogOut size={15} color={theme.textFaint} />
+          </TouchableOpacity>
         </View>
         <Text style={styles.subtitle}>
           {role === 'MECHANIC' ? 'Mechanic Registration' : 'Driver Registration'}
@@ -156,6 +169,8 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: theme.bg },
   header: { paddingHorizontal: 24, paddingTop: 48, paddingBottom: 24, borderBottomWidth: 1, borderBottomColor: theme.border },
   row: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+  headerRow: { justifyContent: 'space-between', marginBottom: 0 },
+  signOutBtn: { borderWidth: 1, borderColor: theme.border, borderRadius: 16, padding: 7 },
   title: { fontFamily: fonts.displayBold, fontSize: 22, color: theme.text },
   subtitle: { fontFamily: fonts.displayBold, fontSize: 17, color: theme.amber, marginBottom: 6 },
   desc: { fontFamily: fonts.body, fontSize: 13, color: theme.textMuted, lineHeight: 19 },

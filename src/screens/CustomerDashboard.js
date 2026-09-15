@@ -7,7 +7,8 @@ import * as SMS from 'expo-sms';
 import * as ImagePicker from 'expo-image-picker';
 import VehicleMap from '../components/VehicleMap';
 import { auth, db, storage } from '../../firebaseConfig';
-import { collection, addDoc, serverTimestamp, doc, onSnapshot, getDoc, updateDoc, query, where } from 'firebase/firestore';
+import { collection, addDoc, serverTimestamp, doc, onSnapshot, getDoc, getDocs, updateDoc, query, where } from 'firebase/firestore';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { theme, fonts } from '../theme/theme';
 import { haversineKm } from '../lib/geo';
@@ -19,6 +20,28 @@ const ISSUES = [
   { key: "lockout", label: "Locked out", icon: KeyRound },
   { key: "other", label: "Other issue", icon: CarIcon },
 ];
+
+// Mechanics with a contact number, cached locally so the offline SMS
+// escalation can address real people even with no data connection.
+const MECHANICS_CACHE_KEY = 'sos_mechanics_cache_v1';
+const SOS_WRITE_TIMEOUT_MS = 6000;
+
+// Firestore doesn't reject writes while offline — it queues them and the
+// promise hangs. This timeout turns "hanging" into a decision.
+const withTimeout = (promise, ms) =>
+  new Promise((_, reject) => {
+    const t = setTimeout(() => reject(new Error('SOS_WRITE_TIMEOUT')), ms);
+    promise.finally(() => clearTimeout(t));
+  });
+
+const loadCachedMechanics = async () => {
+  try {
+    const raw = await AsyncStorage.getItem(MECHANICS_CACHE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    return [];
+  }
+};
 
 const STEPS = [
   { key: "sent", label: "Request sent" },
@@ -99,7 +122,9 @@ export default function CustomerDashboard() {
   const [plate, setPlate] = useState("");
   const [vehicleInfo, setVehicleInfo] = useState("");
   const [contactNumber, setContactNumber] = useState("");
+  const [emergencyContact, setEmergencyContact] = useState("");
   const [notifyContact, setNotifyContact] = useState(true);
+  const [smsRecipients, setSmsRecipients] = useState([]);
   
   const [stepIndex, setStepIndex] = useState(0);
   const [smsStatus, setSmsStatus] = useState("idle");
@@ -112,6 +137,30 @@ export default function CustomerDashboard() {
   const [initialLocation, setInitialLocation] = useState(null);
   const [addressText, setAddressText] = useState("Fetching location...");
   const timers = useRef([]);
+  const pendingWriteRef = useRef(null);
+  const abandonedRef = useRef(false);
+
+  // Refresh the offline mechanic directory whenever the SOS form is shown.
+  // Equality-only filters don't need a composite index; verified/setup
+  // filtering happens client-side on the small result set.
+  useEffect(() => {
+    if (phase !== "form") return;
+    (async () => {
+      try {
+        const snap = await getDocs(query(collection(db, 'users'), where("role", "==", "MECHANIC")));
+        const list = snap.docs
+          .map((d) => d.data())
+          .filter((m) => m.isVerified && m.isSetupComplete && m.contactNumber)
+          .map((m) => ({ name: m.name || 'Mechanic', shopName: m.shopName || '', contactNumber: m.contactNumber }))
+          .slice(0, 8);
+        if (list.length > 0) {
+          await AsyncStorage.setItem(MECHANICS_CACHE_KEY, JSON.stringify(list));
+        }
+      } catch (e) {
+        console.log('Mechanic directory refresh failed (will use cache):', e);
+      }
+    })();
+  }, [phase]);
 
   // Resume an in-progress emergency after a reload/app restart — a driver
   // must never lose their tracking screen mid-SOS. (Unindexed single-field
@@ -159,6 +208,24 @@ export default function CustomerDashboard() {
     return () => timers.current.forEach(clearTimeout);
   }, []);
 
+  // Queued-write recovery: if a timed-out SOS write lands after we've fallen
+  // back to SMS mode, jump back into normal tracking automatically.
+  useEffect(() => {
+    const pending = pendingWriteRef.current;
+    if (!pending || abandonedRef.current === false) return;
+    let cancelled = false;
+    pending
+      .then((docRef) => {
+        if (cancelled || !abandonedRef.current) return;
+        abandonedRef.current = false;
+        setCurrentRequestId(docRef.id);
+        setPhase("tracking");
+        setStepIndex(0);
+      })
+      .catch(() => {}); // never landed; SMS path stands
+    return () => { cancelled = true; };
+  }, [phase]);
+
   useEffect(() => {
     if (currentRequestId) {
       const unsub = onSnapshot(doc(db, 'serviceRequests', currentRequestId), async (snapshot) => {
@@ -199,6 +266,8 @@ export default function CustomerDashboard() {
   const reset = () => {
     timers.current.forEach(clearTimeout);
     timers.current = [];
+    pendingWriteRef.current = null;
+    abandonedRef.current = false;
     setPhase("form");
     setIssue(null);
     setIssueDetails("");
@@ -282,7 +351,7 @@ export default function CustomerDashboard() {
                 }
             }
 
-            const docRef = await addDoc(collection(db, 'serviceRequests'), {
+            const sosDoc = {
                 customerId: auth.currentUser?.uid || 'guest',
                 contactName: customerName,
                 status: 'PENDING',
@@ -297,30 +366,87 @@ export default function CustomerDashboard() {
                 },
                 imageUrl,
                 createdAt: serverTimestamp(),
-            });
-            
+            };
+
+            // Timeout instead of hang: if the write hasn't confirmed in
+            // SOS_WRITE_TIMEOUT_MS, treat connectivity as lost and escalate
+            // to SMS. The queued write may still land when data returns —
+            // setPhase('tracking') below reconciles either way.
+            abandonedRef.current = false;
+            pendingWriteRef.current = addDoc(collection(db, 'serviceRequests'), sosDoc);
+            const docRef = await withTimeout(pendingWriteRef.current, SOS_WRITE_TIMEOUT_MS);
+
             setCurrentRequestId(docRef.id);
             setPhase("tracking");
             setStepIndex(0);
 
         } catch (firebaseErr) {
-            console.log("Firebase failed, possibly offline: ", firebaseErr);
-            setPhase("smsFallback");
-            setSmsStatus("sending");
-            
-            const isAvailable = await SMS.isAvailableAsync();
-            if (isAvailable) {
-                await SMS.sendSMSAsync(
-                    ['1234567890'], 
-                    `SOS ${plate} ${issue} ${location.coords.latitude},${location.coords.longitude}`
-                );
-            }
-            timers.current.push(setTimeout(() => setSmsStatus("sent"), 1800));
+            console.log("Firebase write timed out or failed — escalating to SMS:", firebaseErr);
+            abandonedRef.current = true;
+            await escalateToSms(location);
         }
 
     } catch (err) {
         console.error("Error", err.message);
         Alert.alert('Something went wrong', 'Your SOS could not be sent. Please try again or call the hotline.');
+    }
+  };
+
+  // The driver's name for the SMS payload: prefer the registered profile.
+  const customerNameForSms = async () => {
+    try {
+      if (auth.currentUser) {
+        const profileSnap = await getDoc(doc(db, 'users', auth.currentUser.uid));
+        if (profileSnap.exists() && profileSnap.data().name) return profileSnap.data().name;
+      }
+    } catch (e) {}
+    return 'Driver';
+  };
+
+  // Offline escalation: text the cached, real, nearby mechanics (and the
+  // emergency contact if opted in) with the full SOS details and a maps link.
+  const escalateToSms = async (location) => {
+    const name = await customerNameForSms();
+    const lat = location.coords.latitude.toFixed(5);
+    const lng = location.coords.longitude.toFixed(5);
+    const issueLabel = issue ? ISSUES.find((i) => i.key === issue)?.label.toUpperCase() : 'VEHICLE TROUBLE';
+    const mapsLink = `https://maps.google.com/?q=${lat},${lng}`;
+    const payload = [
+      `SOS ${plate || '—'} ${issueLabel}`,
+      `${vehicleInfo || 'Vehicle details unknown'} — driver: ${name}`,
+      contactNumber.trim() ? `Call driver: ${contactNumber.trim()}` : null,
+      `Location: ${mapsLink}`,
+    ].filter(Boolean).join('\n');
+
+    const cached = await loadCachedMechanics();
+    const recipients = cached.map((m) => m.contactNumber);
+    setSmsRecipients(cached);
+
+    if (notifyContact && emergencyContact.trim()) {
+      recipients.push(emergencyContact.trim());
+    }
+
+    setPhase("smsFallback");
+    setSmsStatus("sending");
+
+    if (recipients.length === 0) {
+      setSmsStatus('none');
+      return;
+    }
+
+    try {
+      const isAvailable = await SMS.isAvailableAsync();
+      if (isAvailable) {
+        await SMS.sendSMSAsync(recipients, payload);
+        setSmsStatus("sent");
+      } else {
+        // Web (or SMS-less device): show the payload + recipients so the
+        // driver can call or copy them. No fake success.
+        setSmsStatus('manual');
+      }
+    } catch (smsErr) {
+      console.log('SMS send failed:', smsErr);
+      setSmsStatus('manual');
     }
   };
 
@@ -445,6 +571,23 @@ export default function CustomerDashboard() {
               <View style={[styles.toggleThumb, { left: notifyContact ? 19 : 3 }]} />
             </TouchableOpacity>
           </View>
+
+          {notifyContact && (
+            <View style={styles.section}>
+              <Text style={styles.label}>EMERGENCY CONTACT NUMBER</Text>
+              <TextInput
+                style={styles.input}
+                value={emergencyContact}
+                onChangeText={(text) => setEmergencyContact(text.replace(/[^0-9+]/g, ''))}
+                placeholder="0918 123 4567"
+                placeholderTextColor={theme.textFaint}
+                keyboardType="phone-pad"
+              />
+              <Text style={styles.hintText}>
+                Texted your SOS details and location if there's no data signal.
+              </Text>
+            </View>
+          )}
 
           <View style={{ paddingHorizontal: 20, marginTop: 16 }}>
             <TouchableOpacity onPress={takePhoto} style={styles.photoBtn}>
@@ -572,42 +715,69 @@ export default function CustomerDashboard() {
             <View style={styles.smsPayload}>
               <Text style={styles.smsPayloadText}>
                 SOS {plate || "—"} {issue ? ISSUES.find((i) => i.key === issue)?.label.toUpperCase() : ""}
+                {"\n"}{vehicleInfo || 'Vehicle details unknown'}
+                {"\n"}Location: https://maps.google.com/?q={initialLocation ? `${initialLocation.latitude.toFixed(5)},${initialLocation.longitude.toFixed(5)}` : '—'}
               </Text>
             </View>
             <View style={[styles.row, { marginTop: 12 }]}>
               {smsStatus === "sending" && (
                 <>
                   <Clock size={14} color={theme.amber} />
-                  <Text style={[styles.smsStatusText, { color: theme.amber }]}>Sending to nearby registered mechanics…</Text>
+                  <Text style={[styles.smsStatusText, { color: theme.amber }]}>Texting nearby registered mechanics…</Text>
                 </>
               )}
               {smsStatus === "sent" && (
                 <>
                   <CheckCircle2 size={14} color={theme.green} />
-                  <Text style={[styles.smsStatusText, { color: theme.green }]}>Sent to nearby mechanics via SMS.</Text>
+                  <Text style={[styles.smsStatusText, { color: theme.green }]}>SMS handed to your phone for delivery.</Text>
+                </>
+              )}
+              {smsStatus === "none" && (
+                <>
+                  <MessageSquareWarning size={14} color={theme.amber} />
+                  <Text style={[styles.smsStatusText, { color: theme.amber }]}>No cached mechanics yet — call the hotline below.</Text>
+                </>
+              )}
+              {smsStatus === "manual" && (
+                <>
+                  <MessageSquareWarning size={14} color={theme.amber} />
+                  <Text style={[styles.smsStatusText, { color: theme.amber }]}>Can't auto-send here — tap a mechanic below to call.</Text>
                 </>
               )}
             </View>
+            {smsRecipients.length > 0 && (
+              <View style={{ marginTop: 10 }}>
+                {smsRecipients.map((m, idx) => (
+                  <TouchableOpacity
+                    key={`${m.contactNumber}-${idx}`}
+                    style={[styles.listItem, idx === 0 && { borderTopWidth: 0 }]}
+                    onPress={() => Linking.openURL(`tel:${m.contactNumber.replace(/[^0-9+]/g, '')}`)}
+                  >
+                    <PhoneCall size={16} color={theme.amber} />
+                    <View style={styles.flex1}>
+                      <Text style={styles.listTitle}>{m.shopName || m.name}</Text>
+                      <Text style={styles.listSub}>{m.contactNumber} · tap to call</Text>
+                    </View>
+                    <ChevronRight size={15} color={theme.textFaint} />
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
           </View>
 
           <View style={styles.section}>
             <Text style={styles.label}>WHILE YOU WAIT — OTHER WAYS TO GET HELP</Text>
-            <View style={styles.listItem}>
+            <TouchableOpacity
+              style={styles.listItem}
+              onPress={() => Linking.openURL('tel:09170000000')}
+            >
               <PhoneCall size={16} color={theme.text} />
               <View style={styles.flex1}>
                 <Text style={styles.listTitle}>Call AyudaAuto Hotline</Text>
-                <Text style={styles.listSub}>0917 000 0000 · 24/7</Text>
+                <Text style={styles.listSub}>0917 000 0000 · 24/7 · tap to call</Text>
               </View>
               <ChevronRight size={15} color={theme.textFaint} />
-            </View>
-            <View style={styles.listItem}>
-              <Wrench size={16} color={theme.text} />
-              <View style={styles.flex1}>
-                <Text style={styles.listTitle}>Nearby shop: Montalban Motorworks</Text>
-                <Text style={styles.listSub}>1.1 km · open now</Text>
-              </View>
-              <ChevronRight size={15} color={theme.textFaint} />
-            </View>
+            </TouchableOpacity>
           </View>
 
           <View style={{ paddingHorizontal: 20, paddingTop: 16, paddingBottom: 20 }}>
@@ -721,6 +891,7 @@ const styles = StyleSheet.create({
   },
   mechanicIconBox: { width: 40, height: 40, borderRadius: 6, backgroundColor: theme.raised, alignItems: 'center', justifyContent: 'center' },
   distanceText: { fontFamily: fonts.body, fontSize: 11.5, color: theme.textMuted, marginTop: 8 },
+  hintText: { fontFamily: fonts.body, fontSize: 11, color: theme.textFaint, marginTop: 6 },
   mechanicName: { fontFamily: fonts.bodySemibold, fontSize: 13.5, color: theme.text },
   mechanicSub: { fontFamily: fonts.body, fontSize: 11.5, color: theme.textMuted },
   cancelBtn: {
