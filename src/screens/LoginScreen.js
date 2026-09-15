@@ -5,6 +5,7 @@ import { doc, setDoc } from 'firebase/firestore';
 import { auth, db } from '../../firebaseConfig';
 import { theme, fonts } from '../theme/theme';
 import { Siren } from 'lucide-react-native';
+import { ConnectivityBanner } from '../components/ConnectivityBanner';
 
 export default function LoginScreen() {
     const [role, setRole] = useState('CUSTOMER');
@@ -66,10 +67,11 @@ export default function LoginScreen() {
 
     return (
         <View style={styles.container}>
+            <ConnectivityBanner />
             <View style={styles.logoContainer}>
                 <View style={styles.row}>
                     <Siren size={28} color={theme.amber} />
-                    <Text style={styles.title}>AyudaAuto</Text>
+                    <Text style={styles.title}>VESOS</Text>
                 </View>
                 <Text style={styles.subtitle}>emergency roadside assistance</Text>
             </View>

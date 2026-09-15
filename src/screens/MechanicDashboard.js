@@ -7,6 +7,7 @@ import { signOut } from 'firebase/auth';
 import { auth, db } from '../../firebaseConfig';
 import * as Location from 'expo-location';
 import { haversineKm } from '../lib/geo';
+import { ConnectivityBanner } from '../components/ConnectivityBanner';
 
 export default function MechanicDashboard() {
   const [online, setOnline] = useState(true);
@@ -200,6 +201,7 @@ export default function MechanicDashboard() {
 
   return (
     <View style={styles.container}>
+      <ConnectivityBanner />
       <View style={styles.header}>
         <View>
           <Text style={styles.shopName}>{shopName}</Text>

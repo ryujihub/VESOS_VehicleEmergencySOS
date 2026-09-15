@@ -1,0 +1,33 @@
+rules_version = '2';
+
+// VESOS / AyudaAuto — Storage rules
+//
+// IDs and SOS photos are user-uploaded images only, capped in size, and
+// readable by signed-in users (mechanics must see the SOS photo; ID review
+// happens via the Firebase console / Admin SDK, which bypass these rules).
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Mechanic ID photos: ids/{uid}.jpg — one per user, created by that
+    // user, immutable once written (no silent swapping).
+    match /ids/{userId}.jpg {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow update, delete: if false; // immutable evidence
+    }
+
+    // SOS problem photos: emergencies/{millis}.jpg — any signed-in user may
+    // file one; readable by signed-in users (the responding mechanic needs
+    // to see the problem before driving out).
+    match /emergencies/{fileName} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow update, delete: if false;
+    }
+  }
+}

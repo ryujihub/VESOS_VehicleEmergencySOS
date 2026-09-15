@@ -4,14 +4,19 @@ import { doc, setDoc } from 'firebase/firestore';
 import { signOut } from 'firebase/auth';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import * as ImagePicker from 'expo-image-picker';
+import * as Location from 'expo-location';
 import { auth, db, storage } from '../../firebaseConfig';
 import { theme, fonts } from '../theme/theme';
-import { Siren, Camera, User, Wrench, Phone, LogOut } from 'lucide-react-native';
+import { Siren, Camera, User, Wrench, Phone, LogOut, MapPin } from 'lucide-react-native';
 
 export default function RegistrationScreen({ role }) {
   const [fullName, setFullName] = useState('');
   const [shopName, setShopName] = useState('');
   const [contactNumber, setContactNumber] = useState('');
+  // Shop coordinates: lets the offline SOS escalation text only mechanics
+  // who can actually reach a stranded driver (radius-filtered).
+  const [shopLocation, setShopLocation] = useState(null);
+  const [locCapturing, setLocCapturing] = useState(false);
   const [idPhoto, setIdPhoto] = useState(null);
   const [loading, setLoading] = useState(false);
 
@@ -22,6 +27,27 @@ export default function RegistrationScreen({ role }) {
       quality: 0.7,
     });
     if (!result.canceled) setIdPhoto(result.assets[0].uri);
+  };
+
+  const captureShopLocation = async () => {
+    setLocCapturing(true);
+    try {
+      let { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert(
+          'Location needed',
+          "Without your shop's location, stranded drivers can't reach you when they lose data signal — offline SOS is texted to nearby shops only."
+        );
+        return;
+      }
+      const pos = await Location.getCurrentPositionAsync({});
+      setShopLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+    } catch (e) {
+      console.log('Shop location capture failed:', e);
+      Alert.alert('Location unavailable', 'Could not get your position. You can retry or continue without it.');
+    } finally {
+      setLocCapturing(false);
+    }
   };
 
   const handleSubmit = async () => {
@@ -35,6 +61,12 @@ export default function RegistrationScreen({ role }) {
     }
     if (role === 'MECHANIC' && contactNumber.replace(/[^0-9]/g, '').length < 7) {
       Alert.alert('Required', 'Please enter a valid contact number so customers can reach you.');
+      return;
+    }
+    // Anti-impersonation: no ID photo, no listing. A shop without a submitted
+    // ID can never appear as a verified mechanic to drivers.
+    if (role === 'MECHANIC' && !idPhoto) {
+      Alert.alert('Required', 'A photo of your valid ID or mechanic certificate is required before your shop can be listed.');
       return;
     }
 
@@ -62,7 +94,13 @@ export default function RegistrationScreen({ role }) {
         name: fullName.trim(),
         role: role || (auth.currentUser?.isAnonymous ? 'CUSTOMER' : 'MECHANIC'),
         ...(role === 'MECHANIC' && { shopName: shopName.trim(), contactNumber: contactNumber.trim() }),
+        ...(role === 'MECHANIC' && shopLocation && { shopLocation }),
         ...(idUrl && { idUrl }),
+        // Verified-at-registration: the grant happens HERE (email verified
+        // in auth + ID photo uploaded in this same write) instead of the old
+        // auto-grant-on-email — the server rules accept this grant only in
+        // that exact combination, and only for non-anonymous accounts.
+        ...(role === 'MECHANIC' && idUrl && auth.currentUser?.emailVerified && { isVerified: true }),
         isSetupComplete: true,
       }, { merge: true });
     } catch (e) {
@@ -78,7 +116,7 @@ export default function RegistrationScreen({ role }) {
         <View style={[styles.row, styles.headerRow]}>
           <View style={styles.row}>
             <Siren size={22} color={theme.amber} />
-            <Text style={styles.title}>AyudaAuto</Text>
+            <Text style={styles.title}>VESOS</Text>
           </View>
           <TouchableOpacity
             onPress={() => signOut(auth).catch((e) => console.warn('Sign out failed:', e))}
@@ -137,7 +175,23 @@ export default function RegistrationScreen({ role }) {
               />
             </View>
 
-            <Text style={[styles.label, { marginTop: 20 }]}>VALID ID / CERTIFICATION PHOTO</Text>
+            <Text style={[styles.label, { marginTop: 20 }]}>SHOP LOCATION</Text>
+            <TouchableOpacity
+              style={[styles.photoBtn, shopLocation && { borderColor: theme.green }]}
+              onPress={captureShopLocation}
+              disabled={locCapturing}
+            >
+              <MapPin size={18} color={shopLocation ? theme.green : theme.textMuted} />
+              <Text style={[styles.photoText, { color: shopLocation ? theme.green : theme.textMuted }]}>
+                {locCapturing
+                  ? 'Getting your position…'
+                  : shopLocation
+                    ? `Shop location set ✓ (${shopLocation.lat.toFixed(4)}, ${shopLocation.lng.toFixed(4)})`
+                    : 'Use my current location — so offline SOS can find you'}
+              </Text>
+            </TouchableOpacity>
+
+            <Text style={[styles.label, { marginTop: 20 }]}>VALID ID / CERTIFICATION PHOTO (REQUIRED)</Text>
             <TouchableOpacity style={styles.photoBtn} onPress={pickId}>
               <Camera size={18} color={idPhoto ? theme.green : theme.textMuted} />
               <Text style={[styles.photoText, { color: idPhoto ? theme.green : theme.textMuted }]}>

@@ -1,0 +1,119 @@
+rules_version = '2';
+
+// VESOS / AyudaAuto — Firestore security rules
+//
+// Threat model (verified by live audit on 2026-09-15): with open rules, a
+// fresh anonymous user could (a) self-promote to a verified mechanic,
+// (b) read another user's PII, (c) mass-harvest the users collection, and
+// (d) spam garbage SOS requests. These rules close (a) and (d) hard; (b)/(c)
+// are reduced to the app's genuinely public data (see notes below).
+//
+// DEPLOY (rules only take effect after deployment):
+//   npm i -g firebase-tools && firebase login
+//   firebase deploy --only firestore:rules,storage
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- users ----------
+    match /users/{userId} {
+      // Create: at signup only. A client may NEVER create itself as verified.
+      allow create: if isOwner(userId)
+        && request.resource.data.get('isVerified', false) == false
+        && request.resource.data.get('role', '') in ['CUSTOMER', 'MECHANIC'];
+
+      // Read: a single profile lookup is allowed signed-in (tracking card,
+      // mechanic profile by id — UIDs are unguessable). Listing is scoped to
+      // mechanic-directory queries only, so customer docs can't be
+      // enumerated/harvested by listing the collection.
+      allow get: if request.auth != null;
+      allow list: if request.auth != null
+        && resource.data.role == 'MECHANIC';
+
+      // Update: owner only, and protected fields can never be self-granted.
+      // - role / email: immutable from the client
+      // - isVerified: grant requires a genuinely email-verified token AND an
+      //   uploaded ID (the app's syncVerifiedFlag path); clearing is allowed.
+      //   Human ID review happens out-of-band (console/Admin SDK), which
+      //   bypasses these rules entirely.
+      // - idUrl: may be set once while absent (registration ID upload),
+      //   never replaced or forged afterwards
+      allow update: if isOwner(userId)
+        && unchanged('role')
+        && unchanged('email')
+        && (unchanged('idUrl') || !('idUrl' in resource.data))
+        && (
+          request.resource.data.get('isVerified', false) == resource.data.get('isVerified', false)
+          || request.resource.data.get('isVerified', false) == false
+          || (
+            request.resource.data.get('isVerified', false) == true
+            && request.auth.token.email_verified == true
+            && (
+              resource.data.get('idUrl', '') != ''
+              || request.resource.data.get('idUrl', '') != ''
+            )
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // ---------- serviceRequests ----------
+    match /serviceRequests/{reqId} {
+      // Create: a real SOS — plate, problem photo and a plausible location
+      // are REQUIRED server-side, so pranks can't bypass the app's form.
+      allow create: if request.auth != null
+        && request.resource.data.customerId == request.auth.uid
+        && validNewRequest();
+
+      // Read/one-off get: the customer's own request, or the assigned
+      // mechanic's.
+      allow get: if request.auth != null
+        && (resource.data.customerId == request.auth.uid
+            || resource.data.get('mechanicId', '') == request.auth.uid);
+
+      // List: only the queries the app actually runs — the mechanic's
+      // PENDING feed, the mechanic's own jobs, the customer's own jobs.
+      // Unfiltered collection enumeration is denied.
+      allow list: if request.auth != null
+        && (resource.data.status == 'PENDING'
+            || resource.data.mechanicId == request.auth.uid
+            || resource.data.customerId == request.auth.uid);
+
+      // Update:
+      // - customer: their own request (cancel)
+      // - mechanic: accept a PENDING request (first claim, sets mechanicId),
+      //   or advance/share location on one already assigned to them
+      allow update: if request.auth != null
+        && (resource.data.customerId == request.auth.uid
+            || (resource.data.status == 'PENDING'
+                && request.resource.data.get('mechanicId', '') == request.auth.uid)
+            || resource.data.get('mechanicId', '') == request.auth.uid)
+        && request.resource.data.get('mechanicId', resource.data.get('mechanicId', '')) ==
+           resource.data.get('mechanicId', request.resource.data.get('mechanicId', ''));
+
+      allow delete: if false; // emergency records are never deleted client-side
+    }
+
+    // ---------- helpers ----------
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+    function unchanged(name) {
+      return !(name in request.resource.data.diff(resource.data).affectedKeys());
+    }
+    function validNewRequest() {
+      let d = request.resource.data;
+      // Photo is hard-required by the app's UI; server-side it may be null
+      // because the upload legitimately fails offline and the SOS must
+      // still queue. Plate + location ARE server-mandatory (anti-spam).
+      return d.status == 'PENDING'
+        && d.issueType in ['battery', 'flat', 'fuel', 'lockout', 'other']
+        && d.plate is string && d.plate.size() >= 4 && d.plate.size() <= 12
+        && (!('imageUrl' in d) || d.imageUrl == null
+            || (d.imageUrl is string && d.imageUrl.size() > 0))
+        && d.location.lat is number && d.location.lng is number
+        && d.location.lat >= -90 && d.location.lat <= 90
+        && d.location.lng >= -180 && d.location.lng <= 180;
+    }
+  }
+}

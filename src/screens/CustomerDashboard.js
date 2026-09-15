@@ -12,6 +12,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { theme, fonts } from '../theme/theme';
 import { haversineKm } from '../lib/geo';
+import { ConnectivityBanner } from '../components/ConnectivityBanner';
 
 const ISSUES = [
   { key: "battery", label: "Dead battery", icon: Battery },
@@ -25,13 +26,19 @@ const ISSUES = [
 // escalation can address real people even with no data connection.
 const MECHANICS_CACHE_KEY = 'sos_mechanics_cache_v1';
 const SOS_WRITE_TIMEOUT_MS = 6000;
+// Offline SOS is only texted to shops within this distance of the driver.
+const SERVICE_RADIUS_KM = 15;
 
 // Firestore doesn't reject writes while offline — it queues them and the
-// promise hangs. This timeout turns "hanging" into a decision.
+// promise hangs. This timeout turns "hanging" into a decision: resolve with
+// the wrapped promise's outcome, or reject after `ms`, whichever lands first.
 const withTimeout = (promise, ms) =>
-  new Promise((_, reject) => {
+  new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('SOS_WRITE_TIMEOUT')), ms);
-    promise.finally(() => clearTimeout(t));
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
+    );
   });
 
 const loadCachedMechanics = async () => {
@@ -130,11 +137,17 @@ export default function CustomerDashboard() {
   const [smsStatus, setSmsStatus] = useState("idle");
   const [currentRequestId, setCurrentRequestId] = useState(null);
   const [mechanicInfo, setMechanicInfo] = useState(null);
+  // True when a timed-out (queued) SOS write lands after we already fell
+  // back to SMS mode — the reconnect notice then confirms it went through.
+  const [sosDeliveredLate, setSosDeliveredLate] = useState(false);
   const [mechanicLoc, setMechanicLoc] = useState(null);
   const [requestLoc, setRequestLoc] = useState(null);
   const [photo, setPhoto] = useState(null);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [initialLocation, setInitialLocation] = useState(null);
+  // Coordinates the escalation actually used (precise GPS or the coarse
+  // fallback) — shown on the SMS screen, so the driver sees their real link.
+  const [smsEscalationLoc, setSmsEscalationLoc] = useState(null);
   const [addressText, setAddressText] = useState("Fetching location...");
   const timers = useRef([]);
   const pendingWriteRef = useRef(null);
@@ -151,7 +164,7 @@ export default function CustomerDashboard() {
         const list = snap.docs
           .map((d) => d.data())
           .filter((m) => m.isVerified && m.isSetupComplete && m.contactNumber)
-          .map((m) => ({ name: m.name || 'Mechanic', shopName: m.shopName || '', contactNumber: m.contactNumber }))
+          .map((m) => ({ name: m.name || 'Mechanic', shopName: m.shopName || '', contactNumber: m.contactNumber, shopLocation: m.shopLocation || null }))
           .slice(0, 8);
         if (list.length > 0) {
           await AsyncStorage.setItem(MECHANICS_CACHE_KEY, JSON.stringify(list));
@@ -221,6 +234,7 @@ export default function CustomerDashboard() {
         setCurrentRequestId(docRef.id);
         setPhase("tracking");
         setStepIndex(0);
+        setSosDeliveredLate(true);
       })
       .catch(() => {}); // never landed; SMS path stands
     return () => { cancelled = true; };
@@ -295,6 +309,13 @@ export default function CustomerDashboard() {
   };
 
   const sendSOS = async () => {
+    // Required-integrity check (the button is disabled too — this is the
+    // backstop): an SOS without a plate or photo is indistinguishable from
+    // a prank, and responders waste real trips on it.
+    if (!issue || plate.trim().length < 4 || !photo) {
+      Alert.alert('Missing details', 'Select the issue, enter your plate number (at least 4 characters), and attach a photo of the problem before sending.');
+      return;
+    }
     try {
         // An emergency must never silently fail: if location is unavailable,
         // fall back to a coarse area so the SOS still goes out and mechanics
@@ -303,7 +324,9 @@ export default function CustomerDashboard() {
         let location = null;
         if (status === 'granted') {
             try {
-                location = await Location.getCurrentPositionAsync({});
+                // Hard 8s cap: GPS must never stall an emergency (a hung
+                // position fetch here once blocked the whole send).
+                location = await withTimeout(Location.getCurrentPositionAsync({}), 8000);
             } catch (locErr) {
                 console.log('Position fetch failed:', locErr);
             }
@@ -330,8 +353,8 @@ export default function CustomerDashboard() {
                 const response = await fetch(photo);
                 const blob = await response.blob();
                 const storageRef = ref(storage, `emergencies/${Date.now()}.jpg`);
-                await uploadBytes(storageRef, blob);
-                imageUrl = await getDownloadURL(storageRef);
+                await withTimeout(uploadBytes(storageRef, blob), 8000);
+                imageUrl = await withTimeout(getDownloadURL(storageRef), 8000);
             } catch (e) {
                 console.log("Photo upload failed:", e);
             }
@@ -344,7 +367,7 @@ export default function CustomerDashboard() {
             let customerName = null;
             if (auth.currentUser) {
                 try {
-                    const profileSnap = await getDoc(doc(db, 'users', auth.currentUser.uid));
+                    const profileSnap = await withTimeout(getDoc(doc(db, 'users', auth.currentUser.uid)), 4000);
                     if (profileSnap.exists()) customerName = profileSnap.data().name || null;
                 } catch (e) {
                     console.log('Profile lookup failed:', e);
@@ -396,7 +419,7 @@ export default function CustomerDashboard() {
   const customerNameForSms = async () => {
     try {
       if (auth.currentUser) {
-        const profileSnap = await getDoc(doc(db, 'users', auth.currentUser.uid));
+        const profileSnap = await withTimeout(getDoc(doc(db, 'users', auth.currentUser.uid)), 4000);
         if (profileSnap.exists() && profileSnap.data().name) return profileSnap.data().name;
       }
     } catch (e) {}
@@ -419,18 +442,39 @@ export default function CustomerDashboard() {
     ].filter(Boolean).join('\n');
 
     const cached = await loadCachedMechanics();
-    const recipients = cached.map((m) => m.contactNumber);
-    setSmsRecipients(cached);
+    // Radius-filter: only text shops that can plausibly reach the driver.
+    // Nearest first; shops without a captured location ride along at the end
+    // as a safety net rather than being dropped entirely.
+    const driverLoc = { lat: location.coords.latitude, lng: location.coords.longitude };
+    const withDistance = cached
+      .map((m) => ({
+        ...m,
+        distanceKm: m.shopLocation
+          ? haversineKm(driverLoc.lat, driverLoc.lng, m.shopLocation.lat, m.shopLocation.lng)
+          : null,
+      }))
+      .sort((a, b) => {
+        if (a.distanceKm == null) return 1;
+        if (b.distanceKm == null) return -1;
+        return a.distanceKm - b.distanceKm;
+      });
+    const nearby = [
+      ...withDistance.filter((m) => m.distanceKm != null && m.distanceKm <= SERVICE_RADIUS_KM),
+      ...withDistance.filter((m) => m.distanceKm == null),
+    ].slice(0, 5);
+    const recipients = nearby.map((m) => m.contactNumber);
+    setSmsRecipients(nearby);
 
     if (notifyContact && emergencyContact.trim()) {
       recipients.push(emergencyContact.trim());
     }
 
+    setSmsEscalationLoc(driverLoc);
     setPhase("smsFallback");
     setSmsStatus("sending");
 
     if (recipients.length === 0) {
-      setSmsStatus('none');
+      setSmsStatus(cached.length > 0 ? 'far' : 'none');
       return;
     }
 
@@ -453,6 +497,7 @@ export default function CustomerDashboard() {
   return (
     <View style={styles.container}>
       <HazardStripe height={4} />
+      <ConnectivityBanner />
       
       {phase === "form" && (
         <ScrollView style={styles.flex1} contentContainerStyle={{ paddingBottom: 20 }}>
@@ -510,7 +555,7 @@ export default function CustomerDashboard() {
           </View>
 
           <View style={styles.section}>
-            <Text style={styles.label}>PLATE NUMBER</Text>
+            <Text style={styles.label}>PLATE NUMBER (REQUIRED)</Text>
             <TextInput
               style={styles.input}
               value={plate}
@@ -593,19 +638,19 @@ export default function CustomerDashboard() {
             <TouchableOpacity onPress={takePhoto} style={styles.photoBtn}>
               <Camera size={16} color={photo ? theme.green : theme.textMuted} />
               <Text style={[styles.locationText, { color: photo ? theme.green : theme.textMuted }]}>
-                {photo ? "Photo attached (tap to retake)" : "Add a photo of the problem"}
+                {photo ? "Photo attached ✓ (tap to retake)" : "Add a photo of the problem (required)"}
               </Text>
             </TouchableOpacity>
           </View>
 
           <View style={{ paddingHorizontal: 20, marginTop: 24 }}>
             <TouchableOpacity
-              disabled={!issue || uploadingImage}
+              disabled={!issue || plate.trim().length < 4 || !photo || uploadingImage}
               onPress={sendSOS}
               style={[
                 styles.sosButton,
                 {
-                  backgroundColor: issue ? theme.red : theme.surfaceAlt,
+                  backgroundColor: issue && plate.trim().length >= 4 && photo ? theme.red : theme.surfaceAlt,
                   borderColor: issue ? theme.red : theme.border,
                   opacity: issue ? 1 : 0.5,
                 }
@@ -629,6 +674,15 @@ export default function CustomerDashboard() {
               {stepIndex < 5 ? "Help is on the way" : "Almost there"}
             </Text>
           </View>
+          
+          {sosDeliveredLate && (
+            <TouchableOpacity style={styles.lateNotice} onPress={() => setSosDeliveredLate(false)}>
+              <CheckCircle2 size={16} color={theme.green} />
+              <Text style={styles.lateNoticeText}>
+                Signal returned — your SOS just went through. Help is being dispatched.
+              </Text>
+            </TouchableOpacity>
+          )}
           
           <ScrollView style={styles.flex1}>
             <StepTracker currentIndex={stepIndex} />
@@ -716,14 +770,14 @@ export default function CustomerDashboard() {
               <Text style={styles.smsPayloadText}>
                 SOS {plate || "—"} {issue ? ISSUES.find((i) => i.key === issue)?.label.toUpperCase() : ""}
                 {"\n"}{vehicleInfo || 'Vehicle details unknown'}
-                {"\n"}Location: https://maps.google.com/?q={initialLocation ? `${initialLocation.latitude.toFixed(5)},${initialLocation.longitude.toFixed(5)}` : '—'}
+                {"\n"}Location: https://maps.google.com/?q={smsEscalationLoc ? `${smsEscalationLoc.lat.toFixed(5)},${smsEscalationLoc.lng.toFixed(5)}` : '—'}
               </Text>
             </View>
             <View style={[styles.row, { marginTop: 12 }]}>
               {smsStatus === "sending" && (
                 <>
                   <Clock size={14} color={theme.amber} />
-                  <Text style={[styles.smsStatusText, { color: theme.amber }]}>Texting nearby registered mechanics…</Text>
+                  <Text style={[styles.smsStatusText, { color: theme.amber }]}>Texting mechanics near your location…</Text>
                 </>
               )}
               {smsStatus === "sent" && (
@@ -736,6 +790,12 @@ export default function CustomerDashboard() {
                 <>
                   <MessageSquareWarning size={14} color={theme.amber} />
                   <Text style={[styles.smsStatusText, { color: theme.amber }]}>No cached mechanics yet — call the hotline below.</Text>
+                </>
+              )}
+              {smsStatus === "far" && (
+                <>
+                  <MessageSquareWarning size={14} color={theme.amber} />
+                  <Text style={[styles.smsStatusText, { color: theme.amber }]}>No registered shops within {SERVICE_RADIUS_KM} km — call the hotline below.</Text>
                 </>
               )}
               {smsStatus === "manual" && (
@@ -756,7 +816,9 @@ export default function CustomerDashboard() {
                     <PhoneCall size={16} color={theme.amber} />
                     <View style={styles.flex1}>
                       <Text style={styles.listTitle}>{m.shopName || m.name}</Text>
-                      <Text style={styles.listSub}>{m.contactNumber} · tap to call</Text>
+                      <Text style={styles.listSub}>
+                        {m.contactNumber} · tap to call{m.distanceKm != null && ` · ${m.distanceKm < 1 ? `${Math.round(m.distanceKm * 1000)} m` : `${m.distanceKm.toFixed(1)} km`} away`}
+                      </Text>
                     </View>
                     <ChevronRight size={15} color={theme.textFaint} />
                   </TouchableOpacity>
@@ -773,7 +835,7 @@ export default function CustomerDashboard() {
             >
               <PhoneCall size={16} color={theme.text} />
               <View style={styles.flex1}>
-                <Text style={styles.listTitle}>Call AyudaAuto Hotline</Text>
+                <Text style={styles.listTitle}>Call VESOS Hotline</Text>
                 <Text style={styles.listSub}>0917 000 0000 · 24/7 · tap to call</Text>
               </View>
               <ChevronRight size={15} color={theme.textFaint} />
@@ -808,6 +870,24 @@ export default function CustomerDashboard() {
 }
 
 const styles = StyleSheet.create({
+  lateNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginHorizontal: 20,
+    marginTop: 12,
+    padding: 12,
+    borderRadius: 8,
+    backgroundColor: theme.greenDim,
+    borderWidth: 1,
+    borderColor: theme.green,
+  },
+  lateNoticeText: {
+    flex: 1,
+    fontFamily: fonts.bodyMedium,
+    fontSize: 13,
+    color: theme.text,
+  },
   container: { flex: 1, backgroundColor: theme.bg },
   flex1: { flex: 1 },
   row: { flexDirection: 'row', alignItems: 'center', gap: 8 },
